@@ -41,13 +41,15 @@ _MIN_MEANINGFUL_CHARS = 2
 def is_meaningful_transcription(text: str, language_code: Optional[str]) -> bool:
     """False when the transcript is a known hallucination or too short to be speech.
 
-    Known hole (STATUS.md C-1): a bare 「ありがとうございました」 passes. Adding it to
-    the set would throw away a phrase people genuinely say. Separating the two needs
-    utterance length and VAD confidence, which the STT stage does not receive yet.
+    Deliberate hole: a bare 「ありがとうございました」 passes. It is both a Whisper
+    hallucination on near-silence and a phrase people genuinely say, and adding it to
+    the set would throw away the real utterances along with the false ones. Separating
+    the two needs utterance length and VAD confidence, neither of which reaches this
+    stage yet, so the phrase is left through on purpose.
     """
     if not language_code:
         return True
-    if language_code.lower().replace("_", "-").split("-")[0] not in _JAPANESE_LANGUAGE_CODES:
+    if language_code.strip().lower().replace("_", "-").split("-")[0] not in _JAPANESE_LANGUAGE_CODES:
         return True
 
     stripped = text.strip()

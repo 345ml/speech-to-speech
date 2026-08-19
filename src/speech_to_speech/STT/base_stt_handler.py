@@ -9,7 +9,6 @@ from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.pipeline.handler_types import STTIn, STTOut
 from speech_to_speech.pipeline.messages import PartialTranscription, Transcription, VADAudio
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
-from speech_to_speech.STT.hallucinations import is_meaningful_transcription
 
 logger = logging.getLogger(__name__)
 
@@ -62,15 +61,6 @@ class BaseSTTHandler(BaseHandler[STTIn, STTOut]):
         return True
 
     def should_emit_output(self, output: STTOut) -> bool:
-        text = getattr(output, "text", None)
-        if text is not None and not is_meaningful_transcription(text, getattr(output, "language_code", None)):
-            logger.info(
-                "%s: dropped a Japanese Whisper hallucination: %r",
-                self.__class__.__name__,
-                text,
-            )
-            return False
-
         if isinstance(output, PartialTranscription) and self._is_completed_final_revision(output):
             self._log_stale_turn_item(output, "output-after-final")
             return False
