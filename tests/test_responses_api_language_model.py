@@ -1631,3 +1631,45 @@ def test_out_of_band_invalid_input_emits_failed_end_of_response():
     assert isinstance(outputs[0], EndOfResponse)
     assert outputs[0].error is not None
     assert outputs[0].cancel_generation == scope.generation
+
+
+def test_japanese_clauses_are_joined_without_a_space():
+    # " ".join is a property of the language, not a constant: a half-width space
+    # between Japanese clauses is a character the TTS reads out.
+    handler = _make_handler()
+    handler.stream_batch_sentences = 2
+    streamed_events = [
+        _make_text_delta_event("うん、そっか。大変だったね。"),
+        _make_output_item_done_event(content="うん、そっか。大変だったね。"),
+    ]
+    handler.client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **kwargs: _make_stream(streamed_events)),
+    )
+
+    request = _make_request("疲れた")
+    request.language_code = "ja"
+    outputs = list(handler.process(request))
+
+    # The first chunk is a two-clause batch: joined with "" it is exactly the source
+    # text, where " ".join would have inserted a space the TTS reads.
+    texts = [o.text for o in outputs if isinstance(o, LLMResponseChunk)]
+    assert texts == ["うん、そっか。", "大変だったね。"]
+
+
+def test_english_sentences_are_still_joined_with_a_space():
+    handler = _make_handler()
+    handler.stream_batch_sentences = 2
+    streamed_events = [
+        _make_text_delta_event("Hello there. How are you?"),
+        _make_output_item_done_event(content="Hello there. How are you?"),
+    ]
+    handler.client = SimpleNamespace(
+        responses=SimpleNamespace(create=lambda **kwargs: _make_stream(streamed_events)),
+    )
+
+    request = _make_request("Hi")
+    request.language_code = "en"
+    outputs = list(handler.process(request))
+
+    texts = [o.text for o in outputs if isinstance(o, LLMResponseChunk)]
+    assert texts == ["Hello there. How are you?"]

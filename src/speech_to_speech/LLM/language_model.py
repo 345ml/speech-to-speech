@@ -346,6 +346,10 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             if text_only and before:
                 chunks.append(text_chunk(before))
             elif before.strip():
+                # Deliberately still punkt: `make_sentence_tokenizer` (LLM/utils.py)
+                # picks a Japanese clause segmenter by language, but it is wired into
+                # the OpenAI-compatible backend only. This local-transformers backend
+                # was left on the previous behaviour.
                 for s in sent_tokenize_preserving_markdown_code(before, sent_tokenize):
                     ctx.sentence_batch.append(remove_markdown(s))
             if ctx.sentence_batch:
@@ -399,6 +403,8 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             return chunks, tools, pending_marker
 
         if printable_text:
+            # Deliberately still punkt; see the note above. Japanese text reaches the
+            # TTS as one sentence on this backend.
             sentences = sent_tokenize_preserving_markdown_code(printable_text, sent_tokenize)
             if len(sentences) > 1:
                 for s in sentences[:-1]:
