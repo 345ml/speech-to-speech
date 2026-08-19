@@ -5,6 +5,7 @@ from collections.abc import Callable
 from typing import Optional
 
 import requests  # type: ignore[import-untyped]
+from nltk import sent_tokenize
 from PIL import Image
 
 SMART_PUNCT_TRANSLATION = str.maketrans(
@@ -279,3 +280,26 @@ def image_url_to_pil(image_url: str) -> Image.Image:
     resp = requests.get(image_url, timeout=10)
     resp.raise_for_status()
     return Image.open(io.BytesIO(resp.content))
+
+
+# Whisper reports "ja"; some callers pass an ISO 639-2 code or a region tag.
+_JAPANESE_LANGUAGE_CODES = frozenset({"ja", "jpn"})
+
+
+def make_sentence_tokenizer(language_code: Optional[str]) -> Callable[[str], list[str]]:
+    """Return the sentence tokenizer to use for one turn's language.
+
+    NLTK's punkt does not treat 。 as a sentence terminator, so a Japanese reply
+    reaches the TTS as a single sentence and nothing is spoken until generation
+    finishes. Japanese gets a clause segmenter instead; every other language keeps
+    the tokenizer it has always had.
+
+    Japanese returns a NEW instance each call: the segmenter is stateful within a
+    turn (the first clause is cut by a different rule than the rest), so reusing one
+    across turns would stop releasing the opening interjection.
+    """
+    if language_code and language_code.lower().replace("_", "-").split("-")[0] in _JAPANESE_LANGUAGE_CODES:
+        from speech_to_speech.LLM.japanese_segmenter import JapaneseClauseTokenizer
+
+        return JapaneseClauseTokenizer()
+    return sent_tokenize
