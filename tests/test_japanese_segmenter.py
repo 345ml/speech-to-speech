@@ -11,6 +11,7 @@ from speech_to_speech.LLM.japanese_segmenter import (
     JapaneseClauseTokenizer,
     JapaneseSegmenterConfig,
 )
+from speech_to_speech.LLM.utils import MARKDOWN_SENTINEL, sent_tokenize_preserving_markdown_code
 
 
 def test_first_clause_is_cut_at_the_opening_comma() -> None:
@@ -77,3 +78,60 @@ def test_config_is_overridable() -> None:
     tokenizer = JapaneseClauseTokenizer(JapaneseSegmenterConfig(first_min_chars=6))
     # 「うん、」は3文字なので first_min_chars=6 では切れない。
     assert tokenizer("うん、そっか") == ["うん、そっか"]
+
+
+def test_forced_flush_never_cuts_inside_a_markdown_sentinel() -> None:
+    # `sent_tokenize_preserving_markdown_code` hides each complete code span behind a
+    # `\x00markdown-code-N\x00` sentinel and restores it by exact string match. punkt
+    # never split one; the forced flush cuts at an arbitrary index and would, leaving a
+    # raw NUL byte and the literal text `markdown-code-` to be read out by the TTS while
+    # the code span itself disappeared.
+    tokenizer = JapaneseClauseTokenizer()
+    tokenizer("うん、")
+    text = "あ" * 45 + "`inline_code_here`" + "い" * 30
+
+    parts = sent_tokenize_preserving_markdown_code(text, tokenizer)
+
+    assert all(MARKDOWN_SENTINEL not in part for part in parts)
+    assert "".join(parts) == text
+
+
+def test_forced_flush_backs_off_in_front_of_the_sentinel() -> None:
+    # The unit-level statement of the same rule: the cut lands before the sentinel that
+    # is still open, never between its two halves.
+    tokenizer = JapaneseClauseTokenizer()
+    tokenizer("うん、")
+    protected = f"{MARKDOWN_SENTINEL}markdown-code-0{MARKDOWN_SENTINEL}"
+    text = "あ" * 55 + protected + "い" * 20
+
+    parts = tokenizer(text)
+
+    assert parts == ["あ" * 55, protected + "い" * 20]
+
+
+def test_an_unclosed_sentinel_at_index_zero_is_not_cut_to_nothing() -> None:
+    # Backing off in front of a sentinel that opens the buffer gives index 0, which is
+    # not a legal cut: it would emit an empty clause and loop forever on the same buffer.
+    # A complete sentinel is far shorter than max_chars, so this needs a half of one --
+    # what a stray control character in the model output would look like.
+    tokenizer = JapaneseClauseTokenizer()
+    tokenizer("うん、")
+    text = MARKDOWN_SENTINEL + "あ" * 70
+
+    assert tokenizer(text) == [text]
+
+
+def test_a_newline_after_a_full_stop_is_not_emitted_twice() -> None:
+    # \n is a HARD terminator, so it stays with the clause it ends. It was not stripped
+    # from the remainder, so the next clause started with the same newline again.
+    tokenizer = JapaneseClauseTokenizer()
+    buffer = ""
+    clauses: list[str] = []
+    for delta in ("はい。\n", "そう", "だね。\n", "うん"):
+        buffer += delta
+        parts = tokenizer(buffer)
+        clauses.extend(parts[:-1])
+        buffer = parts[-1]
+    clauses.append(buffer)
+
+    assert clauses == ["はい。", "そうだね。", "うん"]

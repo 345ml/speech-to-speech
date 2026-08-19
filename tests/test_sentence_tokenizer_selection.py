@@ -7,7 +7,11 @@ speech-to-speech は全言語共通で nltk の sent_tokenize を通す。punkt 
 from nltk import sent_tokenize
 
 from speech_to_speech.LLM.japanese_segmenter import JapaneseClauseTokenizer
-from speech_to_speech.LLM.utils import make_sentence_tokenizer
+from speech_to_speech.LLM.utils import (
+    is_japanese_language,
+    make_sentence_tokenizer,
+    sentence_join_separator,
+)
 
 
 def test_english_still_gets_the_nltk_tokenizer() -> None:
@@ -39,3 +43,22 @@ def test_each_call_returns_a_fresh_japanese_tokenizer() -> None:
 def test_english_tokenizer_behaviour_is_unchanged() -> None:
     tokenizer = make_sentence_tokenizer("en")
     assert tokenizer("Hello there. How are you?") == sent_tokenize("Hello there. How are you?")
+
+
+def test_japanese_clauses_get_an_empty_separator() -> None:
+    # Japanese does not put a space between clauses, and the TTS reads one out.
+    assert sentence_join_separator("ja") == ""
+    assert sentence_join_separator("ja-JP") == ""
+
+
+def test_every_other_language_keeps_the_ascii_space() -> None:
+    assert sentence_join_separator("en") == " "
+    assert sentence_join_separator(None) == " "
+
+
+def test_a_padded_language_code_is_still_japanese() -> None:
+    # A code arriving as " ja" fell through to the non-Japanese path, silently taking
+    # a Japanese turn back to punkt and to space-joined clauses.
+    assert is_japanese_language(" ja")
+    assert isinstance(make_sentence_tokenizer(" ja"), JapaneseClauseTokenizer)
+    assert sentence_join_separator(" ja\n") == ""

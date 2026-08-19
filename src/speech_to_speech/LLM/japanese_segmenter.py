@@ -18,10 +18,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from speech_to_speech.LLM.utils import MARKDOWN_SENTINEL
+
 HARD = "。．.！!？?…‥\n"
 SOFT = "、，,・：:；;"
 CLOSERS = "」』）)"
 _BLANK = " \t　"
+# Hoisted: `_is_speakable` runs on the per-delta streaming path, and building this
+# inside the generator body concatenated four strings once per character.
+_UNSPEAKABLE = frozenset(HARD + SOFT + CLOSERS + _BLANK)
+# `\n` is a HARD terminator, so it stays with the clause that ends on it. Stripping it
+# from the remainder as well keeps a source newline from being emitted twice.
+_STRIP_AFTER_CUT = _BLANK + "\n"
 
 
 @dataclass(frozen=True)
@@ -42,7 +50,25 @@ class JapaneseSegmenterConfig:
 
 def _is_speakable(text: str) -> bool:
     """False when the fragment is only punctuation or whitespace."""
-    return any(ch not in HARD + SOFT + CLOSERS + _BLANK for ch in text)
+    return any(ch not in _UNSPEAKABLE for ch in text)
+
+
+def _outside_markdown_sentinel(buf: str, end: int) -> int:
+    """Move ``end`` back so a cut never lands inside a Markdown sentinel.
+
+    ``sent_tokenize_preserving_markdown_code`` replaces every complete code span and
+    matched emphasis run with ``\x00markdown-<kind>-N\x00`` before the tokenizer runs
+    and restores it afterwards by exact string match. punkt never split one; a forced
+    flush cuts at an arbitrary character index and can. Neither fragment would then
+    restore, so a raw NUL byte and the literal text ``markdown-code-`` would reach the
+    TTS and the code span itself would be lost.
+
+    An odd number of sentinel characters before ``end`` means a sentinel is still open
+    there, so cut in front of the one that opened it.
+    """
+    if buf.count(MARKDOWN_SENTINEL, 0, end) % 2 == 0:
+        return end
+    return buf.rfind(MARKDOWN_SENTINEL, 0, end)
 
 
 def _protected(buf: str, i: int) -> bool:
@@ -87,7 +113,7 @@ class JapaneseClauseTokenizer:
             if cut is None:
                 break
             parts.append(buf[:cut])
-            buf = buf[cut:].lstrip(_BLANK)
+            buf = buf[cut:].lstrip(_STRIP_AFTER_CUT)
             emitted += 1
         parts.append(buf)
         self._emitted = emitted
@@ -123,7 +149,8 @@ class JapaneseClauseTokenizer:
                 return end
 
         if len(buf) > config.max_chars:
-            end = last_soft if last_soft else config.max_chars
-            if _is_speakable(buf[:end]):
+            end = last_soft if last_soft is not None else config.max_chars
+            end = _outside_markdown_sentinel(buf, end)
+            if end > 0 and _is_speakable(buf[:end]):
                 return end
         return None

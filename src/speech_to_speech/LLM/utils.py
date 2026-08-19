@@ -25,6 +25,13 @@ SPEECHABLE_PATTERN = re.compile(
 MARKDOWN_HEADING_PATTERN = re.compile(r"^[ \t]{0,3}#{1,6}(?:[ \t]+|$)", flags=re.MULTILINE)
 MARKDOWN_BULLET_PATTERN = re.compile(r"^[ \t]{0,3}[-*+][ \t]+", flags=re.MULTILINE)
 
+# Complete Markdown constructs are swapped for `\x00markdown-<kind>-N\x00` tokens
+# while prose-only passes run, and restored afterwards by exact string match. The
+# delimiter is a control character so it cannot occur in model output, and it is named
+# because anything that cuts protected text -- notably the Japanese segmenter's forced
+# flush -- has to know not to cut between the two halves of a token.
+MARKDOWN_SENTINEL = "\x00"
+
 # Protect complete code bodies while prose-only Markdown passes run. Fenced
 # blocks are handled first so their backticks are not mistaken for inline code.
 MARKDOWN_FENCED_CODE_PATTERN = re.compile(
@@ -49,7 +56,7 @@ def _protect_markdown_code(text: str, *, keep_delimiters: bool) -> tuple[str, li
     protected_code: list[str] = []
 
     def protect_code(match: re.Match[str]) -> str:
-        token = f"\x00markdown-code-{len(protected_code)}\x00"
+        token = f"{MARKDOWN_SENTINEL}markdown-code-{len(protected_code)}{MARKDOWN_SENTINEL}"
         protected_code.append(match.group(0) if keep_delimiters else match.group("body"))
         return token
 
@@ -60,7 +67,7 @@ def _protect_markdown_code(text: str, *, keep_delimiters: bool) -> tuple[str, li
 
 def _restore_markdown_code(text: str, protected_code: list[str]) -> str:
     for index, code_body in enumerate(protected_code):
-        text = text.replace(f"\x00markdown-code-{index}\x00", code_body)
+        text = text.replace(f"{MARKDOWN_SENTINEL}markdown-code-{index}{MARKDOWN_SENTINEL}", code_body)
     return text
 
 
@@ -68,7 +75,7 @@ def _protect_matched_emphasis(text: str) -> tuple[str, list[str]]:
     protected_emphasis: list[str] = []
 
     def protect_emphasis(match: re.Match[str]) -> str:
-        token = f"\x00markdown-emphasis-{len(protected_emphasis)}\x00"
+        token = f"{MARKDOWN_SENTINEL}markdown-emphasis-{len(protected_emphasis)}{MARKDOWN_SENTINEL}"
         protected_emphasis.append(match.group(0))
         return token
 
@@ -78,7 +85,7 @@ def _protect_matched_emphasis(text: str) -> tuple[str, list[str]]:
 
 def _restore_matched_emphasis(text: str, protected_emphasis: list[str]) -> str:
     for index, emphasis in enumerate(protected_emphasis):
-        text = text.replace(f"\x00markdown-emphasis-{index}\x00", emphasis)
+        text = text.replace(f"{MARKDOWN_SENTINEL}markdown-emphasis-{index}{MARKDOWN_SENTINEL}", emphasis)
     return text
 
 
@@ -283,7 +290,31 @@ def image_url_to_pil(image_url: str) -> Image.Image:
 
 
 # Whisper reports "ja"; some callers pass an ISO 639-2 code or a region tag.
+# `STT/hallucinations.py` deliberately keeps its own copy: the STT stage must not
+# depend on the LLM package for a language predicate.
 _JAPANESE_LANGUAGE_CODES = frozenset({"ja", "jpn"})
+
+
+def is_japanese_language(language_code: Optional[str]) -> bool:
+    """True when this turn's language needs the Japanese-specific text handling.
+
+    Japanese differs from the other languages in two places that must agree -- which
+    sentence tokenizer runs, and which separator joins a batch of clauses -- so both
+    ask this one question.
+    """
+    if not language_code:
+        return False
+    return language_code.strip().lower().replace("_", "-").split("-")[0] in _JAPANESE_LANGUAGE_CODES
+
+
+def sentence_join_separator(language_code: Optional[str]) -> str:
+    """The string that joins a batch of sentences before it is spoken.
+
+    Japanese does not separate clauses with spaces. A half-width space between them is
+    a character the TTS reads, so it gets an empty separator; every other language keeps
+    the single space it has always had.
+    """
+    return "" if is_japanese_language(language_code) else " "
 
 
 def make_sentence_tokenizer(language_code: Optional[str]) -> Callable[[str], list[str]]:
@@ -298,7 +329,10 @@ def make_sentence_tokenizer(language_code: Optional[str]) -> Callable[[str], lis
     turn (the first clause is cut by a different rule than the rest), so reusing one
     across turns would stop releasing the opening interjection.
     """
-    if language_code and language_code.lower().replace("_", "-").split("-")[0] in _JAPANESE_LANGUAGE_CODES:
+    if is_japanese_language(language_code):
+        # Imported here, not at the top: japanese_segmenter imports MARKDOWN_SENTINEL
+        # from this module, so a top-level import would close a utils -> segmenter ->
+        # utils cycle.
         from speech_to_speech.LLM.japanese_segmenter import JapaneseClauseTokenizer
 
         return JapaneseClauseTokenizer()
