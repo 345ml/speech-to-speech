@@ -132,3 +132,15 @@ class Qwen3TTSHandlerArguments:
         default=512,
         metadata={"help": "Audio chunk size in samples for streaming output. Default is 512."},
     )
+    qwen3_tts_gen_temperature: float = field(
+        default=0.9,
+        metadata={
+            "help": "Sampling temperature for Qwen3-TTS. Default is 0.9, matching mlx-audio. Set to 0 for greedy decoding, which makes the voice identical across runs of the same text -- required when the voice has to stay one recognisable person."
+        },
+    )
+    qwen3_tts_gen_top_k: int = field(
+        default=50,
+        metadata={
+            "help": "Top-k sampling for Qwen3-TTS. Default is 50, matching mlx-audio. Ignored when qwen3_tts_gen_temperature is 0."
+        },
+    )
