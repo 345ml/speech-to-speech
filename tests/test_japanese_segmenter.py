@@ -1,10 +1,12 @@
-"""日本語クローズ分割器のテスト。
+"""Tests for the Japanese clause segmenter.
 
-nltk の punkt は「。」で切らないので、日本語の返答は TTS に1文として渡り、
-生成が終わるまで発話が始まらない。この分割器はその穴を埋める。
+NLTK's punkt does not split on 。, so a Japanese reply reaches the TTS as a single
+sentence and nothing is spoken until generation has finished. This segmenter fills
+that hole.
 
-核になる非対称性: ターン最初のクローズだけ積極的に切る。TTFA のクリティカルパスに
-乗っているのはそれだけで、以降を「、」で切ってもレイテンシは縮まず韻律を損なう。
+The core asymmetry: only the first clause of a turn is cut aggressively. It is the
+only one on the time-to-first-audio critical path; cutting later clauses at 、 buys
+no latency and costs prosody.
 """
 
 from speech_to_speech.LLM.japanese_segmenter import (
@@ -15,13 +17,13 @@ from speech_to_speech.LLM.utils import MARKDOWN_SENTINEL, sent_tokenize_preservi
 
 
 def test_first_clause_is_cut_at_the_opening_comma() -> None:
-    # 「うん、」は2文字+読点。これを即座に出すことが TTFA の短縮そのもの。
+    # 「うん、」 is two characters plus a comma. Releasing it at once IS the TTFA win.
     tokenizer = JapaneseClauseTokenizer()
     assert tokenizer("うん、そっか") == ["うん、", "そっか"]
 
 
 def test_later_clauses_are_not_cut_at_a_short_comma() -> None:
-    # 最初のクローズを出した後は保守的に。短い「、」では切らない。
+    # After the first clause has been released, be conservative: a short 、 is not a cut.
     tokenizer = JapaneseClauseTokenizer()
     tokenizer("うん、")
     assert tokenizer("そっか、大変だったね") == ["そっか、大変だったね"]
@@ -39,7 +41,8 @@ def test_full_stop_splits_after_the_first_clause_too() -> None:
 
 
 def test_decimal_point_is_not_a_sentence_end() -> None:
-    # phase0 の _protected はここを守れていなかった（句読点自身の文字を見ていた）。
+    # The phase 0 _protected did not guard this: it inspected the punctuation character
+    # itself, which decides nothing, instead of its neighbours.
     tokenizer = JapaneseClauseTokenizer()
     assert tokenizer("3.14です。あとで") == ["3.14です。", "あとで"]
 
@@ -50,13 +53,13 @@ def test_closing_bracket_is_absorbed_into_the_clause() -> None:
 
 
 def test_text_without_a_boundary_stays_whole() -> None:
-    # 境界が無ければ1要素。呼び出し側は len(parts) > 1 のときだけフラッシュする。
+    # No boundary means a single element. The caller only flushes when len(parts) > 1.
     tokenizer = JapaneseClauseTokenizer()
     assert tokenizer("今日はいい天気") == ["今日はいい天気"]
 
 
 def test_forced_flush_at_max_chars_when_there_is_no_punctuation() -> None:
-    # 句読点を一つも打たない返答で音声が生成に張り付かないようにする。
+    # Keeps audio from stalling behind generation in a reply with no punctuation at all.
     tokenizer = JapaneseClauseTokenizer()
     tokenizer("うん、")
     assert tokenizer("あ" * 70) == ["あ" * 60, "あ" * 10]
@@ -76,7 +79,7 @@ def test_punctuation_only_fragment_is_not_emitted_as_a_clause() -> None:
 
 def test_config_is_overridable() -> None:
     tokenizer = JapaneseClauseTokenizer(JapaneseSegmenterConfig(first_min_chars=6))
-    # 「うん、」は3文字なので first_min_chars=6 では切れない。
+    # 「うん、」 is three characters, so first_min_chars=6 does not cut it.
     assert tokenizer("うん、そっか") == ["うん、そっか"]
 
 

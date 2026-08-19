@@ -1,11 +1,13 @@
-"""Qwen3-TTS のサンプリングを CLI から止められること。
+"""Turning Qwen3-TTS sampling off from the command line.
 
-mlx-audio は temperature=0.9 / top_k=50 でサンプリングするので、同じ文でも
-声が毎回変わる。同居人として同一人物性が成立しないので、greedy に落とせる
-必要がある(qwen3_tts.py: `if temperature <= 0: return mx.argmax(...)`)。
+mlx-audio samples at temperature=0.9 / top_k=50, so the voice changes on every turn
+even for the same text. A companion has to stay one recognisable person, which needs
+greedy decoding (qwen3_tts.py: `if temperature <= 0: return mx.argmax(...)`).
 
-配線コードは無い。backend_registry の `gen_` 接頭辞規約に乗せているだけなので、
-このテストはその規約が Qwen3-TTS でも成立していることを固定する。
+There is no wiring code: the flags ride on backend_registry's `gen_` prefix
+convention, so these tests pin that the convention holds for Qwen3-TTS. The handler
+tests below cover what the convention cannot -- gen_kwargs reaches the mlx-audio call
+only, so on any other backend the flags have to say they are being ignored.
 """
 
 import dataclasses

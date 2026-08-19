@@ -1,7 +1,9 @@
-"""言語コードによる sentence tokenizer の選択。
+"""Choosing the sentence tokenizer by language code.
 
-speech-to-speech は全言語共通で nltk の sent_tokenize を通す。punkt は「。」で
-切らないので、日本語だけ差し替える。英語の挙動は1バイトも変えない。
+speech-to-speech ran every language through NLTK's sent_tokenize. punkt does not
+split on 。, so Japanese -- and only Japanese -- is swapped for a clause segmenter.
+Every other language's behaviour stays byte-for-byte identical, which is why these
+tests assert object identity rather than equivalent output.
 """
 
 from nltk import sent_tokenize
@@ -33,7 +35,8 @@ def test_japanese_variants_are_recognised() -> None:
 
 
 def test_each_call_returns_a_fresh_japanese_tokenizer() -> None:
-    # ターンをまたいで状態が残ると、2ターン目の冒頭句が切り出されなくなる。
+    # State surviving across turns would stop the second turn's opening interjection
+    # from being cut, because the segmenter would think it had already been released.
     first = make_sentence_tokenizer("ja")
     first("うん、そっか")
     second = make_sentence_tokenizer("ja")
