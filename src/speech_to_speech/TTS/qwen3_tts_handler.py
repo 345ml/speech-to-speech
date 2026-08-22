@@ -25,6 +25,10 @@ from openai.types.realtime.realtime_response_create_params import RealtimeRespon
 from rich.console import Console
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
+from speech_to_speech.arguments_classes.qwen3_tts_arguments import (
+    DEFAULT_GEN_TEMPERATURE,
+    DEFAULT_GEN_TOP_K,
+)
 from speech_to_speech.baseHandler import BaseHandler
 from speech_to_speech.pipeline.cancel_scope import CancelScope
 from speech_to_speech.pipeline.control import SESSION_END, is_control_message
@@ -163,6 +167,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.backend = "mlx" if platform == "darwin" else "faster_qwen3_tts"
         self.streaming_chunk_size = self._resolve_streaming_chunk_size(streaming_chunk_size)
         self._validate_ggml_options()
+        self._warn_about_ignored_gen_kwargs()
 
         if self.backend == "mlx":
             self.device = "mps"
@@ -209,6 +214,31 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         self._initial_ref_rvq = self.ref_rvq
 
         self.warmup()
+
+    def _warn_about_ignored_gen_kwargs(self) -> None:
+        """Say so when sampling options were set on a backend that cannot use them.
+
+        gen_kwargs is spread into the mlx-audio call only; the faster-qwen3-tts paths
+        take a fixed keyword list and never see it. Someone setting
+        --qwen3_tts_gen_temperature 0 on CUDA to stop the voice changing every turn
+        would otherwise get no error and no effect.
+        """
+        if self.backend == "mlx":
+            return
+        ignored = {
+            name: value
+            for name, value, default in (
+                ("temperature", self.gen_kwargs.get("temperature"), DEFAULT_GEN_TEMPERATURE),
+                ("top_k", self.gen_kwargs.get("top_k"), DEFAULT_GEN_TOP_K),
+            )
+            if value is not None and value != default
+        }
+        if ignored:
+            logger.warning(
+                "faster-qwen3-tts Qwen3-TTS does not support %s; ignoring %s",
+                ", ".join(ignored),
+                ignored,
+            )
 
     def _setup_faster(self, model_name: str, dtype: Any, attn_implementation: str, backend: str) -> None:
         try:

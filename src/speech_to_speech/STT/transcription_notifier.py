@@ -18,6 +18,7 @@ from speech_to_speech.pipeline.messages import (
     TranscriptionFailure,
 )
 from speech_to_speech.pipeline.queue_types import TextEventItem
+from speech_to_speech.STT.hallucinations import is_meaningful_transcription
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +77,19 @@ class TranscriptionNotifier(BaseHandler[STTOut, LLMIn]):
             speech_stopped_at_s = None
 
         transcript = str(text)
+        # A Japanese Whisper hallucination is demoted to an empty transcript rather
+        # than dropped: the filter must not skip the completion below. Dropping the
+        # message outright would leave the client's transcription item open forever
+        # (partial deltas have already been sent) and leak its InputItemState.
+        if transcript and not is_meaningful_transcription(transcript, language_code):
+            logger.info(
+                "Dropped a Japanese Whisper hallucination (turn=%s rev=%s): %r",
+                turn_id,
+                turn_revision,
+                transcript,
+            )
+            transcript = ""
+
         # Always close the client-visible transcription item. Empty final STT
         # results should not trigger the LLM, but clients may already have
         # received partial deltas and still need a completed event.

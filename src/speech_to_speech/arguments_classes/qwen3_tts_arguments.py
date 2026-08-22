@@ -1,6 +1,11 @@
 from dataclasses import dataclass, field
 from typing import Literal, Optional
 
+# mlx-audio's own sampling defaults. Named so the handler can tell "the user asked for
+# this" from "nobody touched it" and warn only in the first case.
+DEFAULT_GEN_TEMPERATURE = 0.9
+DEFAULT_GEN_TOP_K = 50
+
 
 @dataclass
 class Qwen3TTSHandlerArguments:
@@ -131,4 +136,16 @@ class Qwen3TTSHandlerArguments:
     qwen3_tts_blocksize: int = field(
         default=512,
         metadata={"help": "Audio chunk size in samples for streaming output. Default is 512."},
+    )
+    qwen3_tts_gen_temperature: float = field(
+        default=DEFAULT_GEN_TEMPERATURE,
+        metadata={
+            "help": "Sampling temperature for Qwen3-TTS, mlx backend only. Default is 0.9, matching mlx-audio. Set to 0 for greedy decoding, which makes the voice identical across runs of the same text -- required when the voice has to stay one recognisable person. The faster-qwen3-tts (CUDA/CPU) backend does not accept it and logs a warning if it is set."
+        },
+    )
+    qwen3_tts_gen_top_k: int = field(
+        default=DEFAULT_GEN_TOP_K,
+        metadata={
+            "help": "Top-k sampling for Qwen3-TTS, mlx backend only. Default is 50, matching mlx-audio. Ignored when qwen3_tts_gen_temperature is 0, and not accepted by the faster-qwen3-tts (CUDA/CPU) backend, which logs a warning if it is set."
+        },
     )

@@ -16,7 +16,6 @@ from urllib.parse import urlparse
 
 import httpx
 import numpy as np
-from nltk import sent_tokenize
 from openai import OpenAI
 from openai.types.realtime.conversation_item import (
     RealtimeConversationItemAssistantMessage,
@@ -41,10 +40,12 @@ from speech_to_speech.LLM.chat import (
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn, build_compactor
 from speech_to_speech.LLM.text_prompt import build_text_system_prompt
 from speech_to_speech.LLM.utils import (
+    make_sentence_tokenizer,
     remove_markdown,
     remove_unspeechable,
     resolve_auto_language,
     sent_tokenize_preserving_markdown_code,
+    sentence_join_separator,
 )
 from speech_to_speech.LLM.voice_prompt import build_voice_system_prompt
 from speech_to_speech.pipeline.cancel_scope import CancelScope
@@ -587,6 +588,11 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         cancelled = False
         printable_text = ""
         sentence_batch: list[str] = []
+        # One tokenizer per turn: the Japanese segmenter is stateful within a turn.
+        sentence_tokenizer = make_sentence_tokenizer(turn.language_code)
+        # The separator is a property of the turn's language, exactly as the tokenizer
+        # is: Japanese does not put a space between clauses, and the TTS reads one.
+        sentence_separator = sentence_join_separator(turn.language_code)
 
         def _flush(batch: list[str]) -> Iterator[LLMOut]:
             if not batch:
@@ -595,7 +601,11 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 logger.info("LLM generation cancelled (stale speculative turn)")
                 return
             state.output_emitted = True
-            yield self._chunk(turn, text=" ".join(batch))
+            # A batch is flushed only once it holds `stream_batch_sentences` sentences,
+            # so the first Japanese clause -- the one on the time-to-first-audio path --
+            # reaches the TTS immediately only under `--stream_batch_sentences 1`.
+            # Making the batch size depend on the clause index is deferred.
+            yield self._chunk(turn, text=sentence_separator.join(batch))
 
         for event in events:
             # Provider usage is billable even when cancellation rolls back the
@@ -614,7 +624,11 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     RealtimeConversationItemAssistantMessage(type="message", role="assistant", content=event.content)
                 )
             elif isinstance(event, ToolCall):
-                # Flush any pending spoken text before emitting the tool call.
+                # Flush any pending spoken text before emitting the tool call. This
+                # bypasses `sentence_tokenizer`, so its per-turn "has the first clause
+                # been released yet" state is not advanced: the first Japanese clause
+                # after a tool call is cut by the conservative later-clause rule and
+                # loses the opening-interjection latency win. Deferred, not overlooked.
                 if printable_text.strip():
                     sentence_batch.append(remove_markdown(printable_text.strip()))
                     printable_text = ""
@@ -644,7 +658,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 state.clean_text += new_text
                 printable_text += new_text
                 trailing_whitespace = printable_text[len(printable_text.rstrip()) :]
-                sentences = sent_tokenize_preserving_markdown_code(printable_text, sent_tokenize)
+                sentences = sent_tokenize_preserving_markdown_code(printable_text, sentence_tokenizer)
                 if len(sentences) > 1:
                     for s in sentences[:-1]:
                         sentence_batch.append(remove_markdown(s))
