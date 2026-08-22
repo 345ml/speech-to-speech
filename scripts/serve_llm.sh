@@ -29,6 +29,33 @@
 #   LLM_MODEL=/path/to/model.gguf  ./scripts/serve_llm.sh   # a loose local file
 #   LLM_PORT=8081                  ./scripts/serve_llm.sh
 #
+# QWEN3.5. The 9B weights are already in that cache, and switching to them is env-only:
+# uncomment the two lines below, or leave the file alone and run
+#   LLAMA_ARG_MMPROJ_AUTO=0 LLM_HF=unsloth/Qwen3.5-9B-GGUF:Q4_K_M ./scripts/serve_llm.sh
+# Nothing on the pipeline side changes. --model_name is only a label: llama-server
+# serves the model it loaded and echoes back its own name, so the two need not match.
+#
+# What it costs. Measured here at Q4_K_M: the 4B is 2.3GB and ~34 tok/s, the 9B 5.3GB
+# and ~17. On a 16GB Mac that is 3GB more taken from the same unified memory the MLX
+# STT and TTS models sit in, for half the generation speed.
+#
+# MMPROJ_AUTO=0 because the unsloth repo ships a vision projector and -hf downloads and
+# loads it by default. This pipeline never sends an image, so that is memory and load
+# time spent on nothing.
+#
+# Thinking. Qwen3.5 is a hybrid, unlike Qwen3-4B-Instruct-2507: left alone it spends the
+# reply inside <think>, and a 120-token probe came back with the content field empty --
+# nothing speakable at all. It stays quiet only because the pipeline sends
+# chat_template_kwargs.enable_thinking=false (responses_api_disable_thinking, on by
+# default for a non-OpenAI base URL) and --jinja below is what makes llama-server honour
+# it. Dropping either one brings the <think> block back.
+#
+# --cache-reuse is inert with this model whatever its value: llama-server logs
+# "cache_reuse is not supported by this context" at startup and disables it, because
+# Qwen3.5 interleaves linear-attention layers whose state cannot be recovered by shifting
+# KV. Every turn that drops an exchange re-prefills from the system prompt. The 4B has no
+# such warning, so the tuning below is tuning for the 4B.
+#
 # FLAGS
 # --parallel 1   one slot holds the whole KV prefix, so --cache-reuse actually hits.
 # --cache-reuse  32 rather than the 256 this defaults to elsewhere. The value is the
@@ -48,6 +75,11 @@ if ! command -v llama-server >/dev/null 2>&1; then
   echo "llama-server not found in PATH. Install llama.cpp (e.g. brew install llama.cpp)." >&2
   exit 1
 fi
+
+# QWEN3.5-9B: uncomment both lines to switch (see QWEN3.5 above). An LLM_HF or
+# LLAMA_ARG_MMPROJ_AUTO already set in the environment still wins.
+# : "${LLM_HF:=unsloth/Qwen3.5-9B-GGUF:Q4_K_M}"
+# export LLAMA_ARG_MMPROJ_AUTO=0
 
 if [ -n "${LLM_MODEL:-}" ]; then
   model_args=(-m "$LLM_MODEL")
