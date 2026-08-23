@@ -16,6 +16,7 @@ from threading import Event
 
 import speech_to_speech.TTS.qwen3_tts_handler as qwen3_tts_module
 from speech_to_speech.arguments_classes.qwen3_tts_arguments import (
+    DEFAULT_GEN_REPETITION_PENALTY,
     DEFAULT_GEN_TEMPERATURE,
     DEFAULT_GEN_TOP_K,
     Qwen3TTSHandlerArguments,
@@ -28,6 +29,7 @@ def test_defaults_match_mlx_audio_so_behaviour_is_unchanged() -> None:
     config = normalize_dataclass_config(Qwen3TTSHandlerArguments(), "qwen3_tts")
     assert config["gen_kwargs"]["temperature"] == 0.9
     assert config["gen_kwargs"]["top_k"] == 50
+    assert config["gen_kwargs"]["repetition_penalty"] == 1.05
 
 
 def test_temperature_reaches_gen_kwargs_not_the_constructor() -> None:
@@ -45,6 +47,15 @@ def test_top_k_reaches_gen_kwargs() -> None:
     config = normalize_dataclass_config(args, "qwen3_tts")
     assert config["gen_kwargs"]["top_k"] == 1
     assert "top_k" not in config
+
+
+def test_repetition_penalty_reaches_gen_kwargs() -> None:
+    # The lever that breaks a greedy decode out of the repeat loop that keeps a preset
+    # speaker from emitting EOS on a short utterance.
+    args = Qwen3TTSHandlerArguments(qwen3_tts_gen_repetition_penalty=1.3)
+    config = normalize_dataclass_config(args, "qwen3_tts")
+    assert config["gen_kwargs"]["repetition_penalty"] == 1.3
+    assert "repetition_penalty" not in config
 
 
 def test_existing_fields_are_untouched() -> None:
@@ -81,7 +92,11 @@ def test_the_defaults_do_not_warn_on_the_torch_backend(monkeypatch, caplog):
     with caplog.at_level(logging.WARNING, logger="speech_to_speech.TTS.qwen3_tts_handler"):
         _setup_handler_off_darwin(
             monkeypatch,
-            {"temperature": DEFAULT_GEN_TEMPERATURE, "top_k": DEFAULT_GEN_TOP_K},
+            {
+                "temperature": DEFAULT_GEN_TEMPERATURE,
+                "top_k": DEFAULT_GEN_TOP_K,
+                "repetition_penalty": DEFAULT_GEN_REPETITION_PENALTY,
+            },
         )
 
     assert caplog.text == ""
@@ -103,5 +118,18 @@ def test_the_mlx_backend_does_not_warn(monkeypatch, caplog):
 
 def test_the_flags_are_documented_as_mlx_only() -> None:
     fields = {field.name: field for field in dataclasses.fields(Qwen3TTSHandlerArguments)}
-    for name in ("qwen3_tts_gen_temperature", "qwen3_tts_gen_top_k"):
+    for name in (
+        "qwen3_tts_gen_temperature",
+        "qwen3_tts_gen_top_k",
+        "qwen3_tts_gen_repetition_penalty",
+    ):
         assert "mlx backend only" in fields[name].metadata["help"], name
+
+
+def test_the_torch_backend_says_so_about_repetition_penalty(monkeypatch, caplog):
+    # Same contract as temperature and top_k: gen_kwargs never reaches the faster
+    # backend, so a value the operator set has to say it is being ignored.
+    with caplog.at_level(logging.WARNING, logger="speech_to_speech.TTS.qwen3_tts_handler"):
+        _setup_handler_off_darwin(monkeypatch, {"repetition_penalty": 1.3})
+
+    assert "repetition_penalty" in caplog.text
