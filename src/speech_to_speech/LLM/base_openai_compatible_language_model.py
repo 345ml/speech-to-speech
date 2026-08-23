@@ -38,8 +38,15 @@ from speech_to_speech.LLM.chat import (
     make_user_message,
 )
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn, build_compactor
+from speech_to_speech.LLM.emotion_tags import (
+    AIZUCHI_SLOT,
+    EmotionTagStripper,
+    is_opening_backchannel,
+    strip_emotion_tags,
+)
 from speech_to_speech.LLM.text_prompt import build_text_system_prompt
 from speech_to_speech.LLM.utils import (
+    is_japanese_language,
     make_sentence_tokenizer,
     remove_markdown,
     remove_unspeechable,
@@ -515,10 +522,12 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         text: str = "",
         tools: list[ResponseFunctionToolCall] | None = None,
         language_code: Optional[str] = None,
+        voice_slot: Optional[str] = None,
     ) -> LLMResponseChunk:
         return LLMResponseChunk(
             text=text,
             language_code=language_code if language_code is not None else turn.language_code,
+            voice_slot=voice_slot,
             tools=tools or [],
             runtime_config=turn.runtime_config,
             response=turn.response,
@@ -593,19 +602,42 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         # The separator is a property of the turn's language, exactly as the tokenizer
         # is: Japanese does not put a space between clauses, and the TTS reads one.
         sentence_separator = sentence_join_separator(turn.language_code)
+        # One stripper per turn: a provider may split "[喜]" across two deltas, so the
+        # hold buffer has to survive between them.
+        emotion_tags = EmotionTagStripper()
+        first_flush_pending = True
+        # The backchannel rule reads a Japanese clause boundary. SOFT also holds ASCII
+        # "," and ":", so without this an English opener could be routed to 相槌.
+        japanese_turn = is_japanese_language(turn.language_code)
 
-        def _flush(batch: list[str]) -> Iterator[LLMOut]:
+        def _flush(batch: list[str], *, from_tokenizer: bool = True) -> Iterator[LLMOut]:
+            nonlocal first_flush_pending
             if not batch:
                 return
             if not self._turn_output_allowed(turn.turn_id, turn.turn_revision):
                 logger.info("LLM generation cancelled (stale speculative turn)")
                 return
             state.output_emitted = True
+            # The Japanese segmenter cuts a turn's first clause at the first boundary of
+            # any kind, precisely so a 2-4 character opening interjection ("うん、") is
+            # released on its own. That clause already IS the backchannel, so routing it
+            # to its own reference voice needs no detector -- only a check that this
+            # really is that short opener and not a batch of full sentences.
+            voice_slot = emotion_tags.slot
+            if (
+                first_flush_pending
+                and from_tokenizer
+                and japanese_turn
+                and len(batch) == 1
+                and is_opening_backchannel(batch[0])
+            ):
+                voice_slot = AIZUCHI_SLOT
+            first_flush_pending = False
             # A batch is flushed only once it holds `stream_batch_sentences` sentences,
             # so the first Japanese clause -- the one on the time-to-first-audio path --
             # reaches the TTS immediately only under `--stream_batch_sentences 1`.
             # Making the batch size depend on the clause index is deferred.
-            yield self._chunk(turn, text=sentence_separator.join(batch))
+            yield self._chunk(turn, text=sentence_separator.join(batch), voice_slot=voice_slot)
 
         for event in events:
             # Provider usage is billable even when cancellation rolls back the
@@ -637,24 +669,27 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                         logger.info("LLM generation cancelled (stale speculative turn)")
                         cancelled = True
                         break
-                    yield from _flush(sentence_batch)
+                    yield from _flush(sentence_batch, from_tokenizer=False)
                     sentence_batch = []
                 yield from self._record_tool_call(state, turn, event.item)
             elif isinstance(event, TextDelta):
+                # Emotion tags are stripped here, upstream of remove_unspeechable (which
+                # keeps square brackets) so they reach neither the TTS nor the history.
+                tagless_text = emotion_tags.feed(event.text)
                 if not turn.wants_audio:
                     # Text-only: forward verbatim. Keep every character (no
                     # remove_unspeechable, which strips TTS-unfriendly symbols) and
                     # don't sentence-split (sent_tokenize collapses newlines/markdown).
-                    state.clean_text += event.text
-                    if event.text:
+                    state.clean_text += tagless_text
+                    if tagless_text:
                         if not self._turn_output_allowed(turn.turn_id, turn.turn_revision):
                             logger.info("LLM generation cancelled (stale speculative turn)")
                             cancelled = True
                             break
                         state.output_emitted = True
-                        yield self._chunk(turn, text=event.text)
+                        yield self._chunk(turn, text=tagless_text)
                     continue
-                new_text = remove_unspeechable(event.text)
+                new_text = remove_unspeechable(tagless_text)
                 state.clean_text += new_text
                 printable_text += new_text
                 trailing_whitespace = printable_text[len(printable_text.rstrip()) :]
@@ -674,6 +709,16 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     printable_text = sentences[-1] + trailing_whitespace
 
         if not cancelled:
+            # A "[" still held at end of turn never closed, so it was ordinary text
+            # rather than a tag. Release it instead of swallowing the character.
+            held = emotion_tags.flush()
+            if held and self._turn_output_allowed(turn.turn_id, turn.turn_revision):
+                if turn.wants_audio:
+                    printable_text += remove_unspeechable(held)
+                else:
+                    state.clean_text += held
+                    state.output_emitted = True
+                    yield self._chunk(turn, text=held)
             if printable_text.strip():
                 sentence_batch.append(remove_markdown(printable_text.strip()))
             if sentence_batch:
@@ -716,7 +761,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 # Text-only keeps every character verbatim; audio strips markdown
                 # and TTS-unfriendly symbols. Not per-delta here: each TextDelta
                 # in the non-streaming path already carries the full response.
-                spoken = event.text if not turn.wants_audio else remove_markdown(remove_unspeechable(event.text))
+                tagless_text, voice_slot = strip_emotion_tags(event.text)
+                spoken = tagless_text if not turn.wants_audio else remove_markdown(remove_unspeechable(tagless_text))
                 state.clean_text += spoken
                 out = spoken if not turn.wants_audio else spoken.strip()
                 if (
@@ -725,7 +771,9 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     and self._turn_output_allowed(turn.turn_id, turn.turn_revision)
                 ):
                     state.output_emitted = True
-                    yield self._chunk(turn, text=out)
+                    # The whole response arrives as one chunk here, so there is no
+                    # opening clause to split off: the emotion voice covers all of it.
+                    yield self._chunk(turn, text=out, voice_slot=voice_slot)
         logger.debug(f"Clean text: {state.clean_text}")
         logger.info(f"Tools: {state.tools}")
         return (
