@@ -1,5 +1,8 @@
 import logging
+import math
+import re
 import sys
+import unicodedata
 from pathlib import Path
 from queue import Queue
 from threading import Event, Thread
@@ -921,7 +924,7 @@ def test_estimate_max_new_tokens_scales_with_utterance_length():
     long_text = " ".join(["This is a deliberately long sentence for the Qwen3 TTS budget estimator."] * 12)
     long_budget = handler._estimate_max_new_tokens(long_text)
 
-    assert short_budget == 360
+    assert short_budget == 80
     assert long_budget > short_budget
     assert long_budget % handler.streaming_chunk_size == 0
     assert long_budget <= handler.max_new_tokens
@@ -940,8 +943,146 @@ def test_estimate_max_new_tokens_uses_cjk_speaking_rate():
         "的氛围，上海会是个很吸引人的地方。你想了解哪方面的具体信息呢？"
     )
 
-    assert handler._estimate_max_new_tokens(short_text) == 360
+    assert handler._estimate_max_new_tokens(short_text) == 144
     assert handler._estimate_max_new_tokens(long_text) == 576
+
+
+def test_estimate_max_new_tokens_bounds_a_short_utterance_to_what_it_could_need():
+    # The 2-4 character opening interjection that japanese_segmenter releases first
+    # ("うん、") is estimated at 1.9s of speech. MIN_QWEN3_TTS_UTTERANCE_TOKENS used to
+    # override that with 28.8s of budget, and CustomVoice -- which has no acoustic
+    # reference to anchor the decode -- never emitted EOS and used every token of it.
+    handler = object.__new__(Qwen3TTSHandler)
+    handler.streaming_chunk_size = 4
+    handler.max_new_tokens = 1536
+
+    budget = handler._estimate_max_new_tokens("うん、")
+
+    assert budget == qwen3_tts_module.MIN_QWEN3_TTS_RUNAWAY_TOKENS
+    assert budget < qwen3_tts_module.MIN_QWEN3_TTS_UTTERANCE_TOKENS
+    assert budget % handler.streaming_chunk_size == 0
+
+
+def test_estimate_max_new_tokens_covers_characters_that_are_spelled_out():
+    # Digits and capitals are read one symbol at a time, so a short string of them is
+    # spoken far longer than a character count at 14/s predicts. Before the estimator
+    # knew that, "09012345678" was budgeted 4.5s against 4.1s of speech -- 90% of the
+    # budget, close enough that a slightly longer number would have been cut off
+    # mid-digit, silently. The durations below were measured on Qwen3-TTS 1.7B.
+    handler = object.__new__(Qwen3TTSHandler)
+    handler.streaming_chunk_size = 4
+    handler.max_new_tokens = 1536
+
+    for text, measured_seconds in (
+        ("AAAAAAAAAAAAAAAAAAAA", 6.08),
+        ("012345678901234567890", 5.98),
+        ("09012345678", 5.98),
+        ("1234567", 3.01),
+        ("ABCDEFG", 3.46),
+    ):
+        budget_seconds = handler._estimate_max_new_tokens(text) / qwen3_tts_module.MLX_STREAMING_TOKENS_PER_SECOND
+        assert budget_seconds >= measured_seconds * 1.5, text
+
+
+def test_estimate_max_new_tokens_keeps_the_floor_once_the_text_could_plausibly_need_it():
+    # The floor still protects an utterance long enough that 360 tokens is a credible
+    # amount of speech for it; only utterances that could never need that much lose it.
+    handler = object.__new__(Qwen3TTSHandler)
+    handler.streaming_chunk_size = 8
+    handler.max_new_tokens = 1536
+
+    text = " ".join(["budget"] * 30) + "."
+
+    assert handler._estimate_max_new_tokens(text) == qwen3_tts_module.MIN_QWEN3_TTS_UTTERANCE_TOKENS
+
+
+def test_estimate_max_new_tokens_never_returns_less_than_the_text_estimate():
+    # Bounding the floor must never starve a real utterance. The check mirrors the
+    # estimator's own arithmetic, and the long case is the one that matters: it is the
+    # only shape where dropping the outer max() would silently cut speech, because its
+    # own estimate already exceeds MIN_QWEN3_TTS_UTTERANCE_TOKENS.
+    handler = object.__new__(Qwen3TTSHandler)
+    handler.streaming_chunk_size = 4
+    handler.max_new_tokens = 4096
+
+    def aligned_estimate(text):
+        words = len(re.findall(r"\w+", text, flags=re.UNICODE))
+        chars = len(re.sub(r"\s+", "", text))
+        cjk = len(qwen3_tts_module.CJK_CHARACTER_PATTERN.findall(text))
+        seconds = (
+            max(
+                words / qwen3_tts_module.ESTIMATED_QWEN3_WORDS_PER_SECOND if words else 0.0,
+                chars / qwen3_tts_module.ESTIMATED_QWEN3_CHARS_PER_SECOND if chars else 0.0,
+                cjk / qwen3_tts_module.ESTIMATED_QWEN3_CJK_CHARS_PER_SECOND if cjk else 0.0,
+            )
+            + sum(unicodedata.category(ch).startswith("P") for ch in text)
+            * qwen3_tts_module.QWEN3_PUNCTUATION_PAUSE_SECONDS
+            + qwen3_tts_module.QWEN3_BASE_PROMPT_SECONDS
+        )
+        tokens = math.ceil(
+            seconds * qwen3_tts_module.MLX_STREAMING_TOKENS_PER_SECOND * qwen3_tts_module.QWEN3_TOKEN_SAFETY_MARGIN
+        )
+        chunk = handler.streaming_chunk_size
+        return max(chunk, math.ceil(tokens / chunk) * chunk)
+
+    long_text = " ".join(["budget"] * 80)
+    assert aligned_estimate(long_text) > qwen3_tts_module.MIN_QWEN3_TTS_UTTERANCE_TOKENS
+
+    for text in ("うん、", "Hello there.", "我懂，心情不好时会让人特别疲惫。", long_text):
+        assert handler._estimate_max_new_tokens(text) >= aligned_estimate(text), text
+
+
+def test_gen_repetition_penalty_reaches_the_mlx_backend(monkeypatch):
+    # repetition_penalty is the lever that breaks a greedy decode out of the repeat
+    # loop that keeps CustomVoice from emitting EOS on a short utterance.
+    captured = {}
+
+    class _FakeMLXLockContext:
+        def __init__(self, handler_name, timeout):
+            self.handler_name = handler_name
+            self.timeout = timeout
+
+        def __enter__(self):
+            return True
+
+        def __exit__(self, *exc):
+            return False
+
+    handler = object.__new__(Qwen3TTSHandler)
+    handler.cancel_scope = None
+    handler.speculative_turns = None
+    handler.should_listen = Event()
+    handler.ref_audio = None
+    handler.ref_spk = None
+    handler.ref_rvq = None
+    handler.ref_text = "Reference text."
+    handler.speaker = "ono_anna"
+    handler.instruct = None
+    handler.language = "japanese"
+    handler.xvec_only = False
+    handler.parity_mode = False
+    handler.non_streaming_mode = None
+    handler.streaming_chunk_size = 4
+    handler.max_new_tokens = 1536
+    handler.blocksize = 512
+    handler.backend = "mlx"
+    handler.gen_kwargs = {"temperature": 0.0, "repetition_penalty": 1.3}
+    handler.queue_in = Queue()
+    handler.model = SimpleNamespace(
+        config=SimpleNamespace(tts_model_type="custom_voice"),
+        generate_custom_voice=lambda **kwargs: (
+            captured.update(kwargs),
+            iter([(_audible_stream_chunk(), 16000, {})]),
+        )[1],
+    )
+
+    monkeypatch.setattr(qwen3_tts_module.console, "print", lambda *args, **kwargs: None)
+    monkeypatch.setattr(qwen3_tts_module, "MLXLockContext", _FakeMLXLockContext)
+
+    list(handler.process(TTSInput(text="うん、")))
+
+    assert captured["repetition_penalty"] == 1.3
+    assert captured["temperature"] == 0.0
 
 
 def test_estimate_max_new_tokens_respects_configured_cap():

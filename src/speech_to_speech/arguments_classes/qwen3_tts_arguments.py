@@ -5,6 +5,7 @@ from typing import Literal, Optional
 # this" from "nobody touched it" and warn only in the first case.
 DEFAULT_GEN_TEMPERATURE = 0.9
 DEFAULT_GEN_TOP_K = 50
+DEFAULT_GEN_REPETITION_PENALTY = 1.05
 
 
 @dataclass
@@ -147,5 +148,11 @@ class Qwen3TTSHandlerArguments:
         default=DEFAULT_GEN_TOP_K,
         metadata={
             "help": "Top-k sampling for Qwen3-TTS, mlx backend only. Default is 50, matching mlx-audio. Ignored when qwen3_tts_gen_temperature is 0, and not accepted by the faster-qwen3-tts (CUDA/CPU) backend, which logs a warning if it is set."
+        },
+    )
+    qwen3_tts_gen_repetition_penalty: float = field(
+        default=DEFAULT_GEN_REPETITION_PENALTY,
+        metadata={
+            "help": "Repetition penalty for Qwen3-TTS, mlx backend only. Default is 1.05, matching mlx-audio. Raise it to about 1.5 on a CustomVoice or VoiceDesign model with qwen3_tts_gen_temperature 0: a preset speaker has no acoustic reference to anchor the decode, so greedy sampling falls into a repeat loop on a short utterance and never emits EOS. The voice-clone path clamps it to at least 1.5 itself, so it changes nothing on a Base model. The faster-qwen3-tts (CUDA/CPU) backend does not accept it and logs a warning if it is set."
         },
     )

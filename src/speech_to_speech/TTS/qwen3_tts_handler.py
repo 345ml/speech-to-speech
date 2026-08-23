@@ -26,6 +26,7 @@ from rich.console import Console
 
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
 from speech_to_speech.arguments_classes.qwen3_tts_arguments import (
+    DEFAULT_GEN_REPETITION_PENALTY,
     DEFAULT_GEN_TEMPERATURE,
     DEFAULT_GEN_TOP_K,
 )
@@ -62,9 +63,23 @@ PIPELINE_SR = 16000
 ESTIMATED_QWEN3_WORDS_PER_SECOND = 2.6
 ESTIMATED_QWEN3_CHARS_PER_SECOND = 14.0
 ESTIMATED_QWEN3_CJK_CHARS_PER_SECOND = 5.5
+# Digits and isolated capitals are read out one symbol at a time, not as a word, so
+# they take about four times longer than their character count predicts. Measured on
+# Qwen3-TTS: 21 digits took 5.98s and 20 capitals 6.08s, both ~3.4 characters/second.
+ESTIMATED_QWEN3_SPELLED_CHARS_PER_SECOND = 3.3
 QWEN3_TOKEN_SAFETY_MARGIN = 1.35
 QWEN3_BASE_PROMPT_SECONDS = 1.0
 QWEN3_PUNCTUATION_PAUSE_SECONDS = 0.5
+# What bounds a decode that never emits EOS. Applied to the raw estimate, before
+# QWEN3_TOKEN_SAFETY_MARGIN, so the budget it allows is 2.5/1.35 ~ 1.85x the margined
+# one. Deliberately loose: the cost of being too generous is a longer runaway, which is
+# audible and already handled by qwen3_tts_gen_repetition_penalty, while the cost of
+# being too tight is a real utterance cut off mid-word, which is silent. The floor
+# below is the same caution applied to the shortest texts, where 2.5x of a sub-second
+# estimate leaves no room at all for anything the estimator does not model.
+QWEN3_RUNAWAY_ESTIMATE_MULTIPLE = 2.5
+MIN_QWEN3_TTS_RUNAWAY_TOKENS = 80
+SPELLED_CHARACTER_PATTERN = re.compile(r"[0-9\uff10-\uff19A-Z\uff21-\uff3a]")
 CJK_CHARACTER_PATTERN = re.compile(
     r"[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff"
     r"\U00020000-\U0002fa1f]"
@@ -230,6 +245,11 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             for name, value, default in (
                 ("temperature", self.gen_kwargs.get("temperature"), DEFAULT_GEN_TEMPERATURE),
                 ("top_k", self.gen_kwargs.get("top_k"), DEFAULT_GEN_TOP_K),
+                (
+                    "repetition_penalty",
+                    self.gen_kwargs.get("repetition_penalty"),
+                    DEFAULT_GEN_REPETITION_PENALTY,
+                ),
             )
             if value is not None and value != default
         }
@@ -642,6 +662,11 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
     def _to_int16(self, audio: np.ndarray) -> np.ndarray:
         return np.clip(audio * 32768, -32768, 32767).astype(np.int16)
 
+    @staticmethod
+    def _align_to_chunk(tokens: float, chunk_size: int) -> int:
+        """Round a token budget up to a whole number of streaming chunks."""
+        return max(chunk_size, math.ceil(tokens / chunk_size) * chunk_size)
+
     def _estimate_max_new_tokens(self, text: Optional[str]) -> int:
         text = (text or "").strip()
         chunk_size = max(1, int(getattr(self, "streaming_chunk_size", 1)))
@@ -656,17 +681,30 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         word_seconds = word_count / ESTIMATED_QWEN3_WORDS_PER_SECOND if word_count else 0.0
         char_seconds = char_count / ESTIMATED_QWEN3_CHARS_PER_SECOND if char_count else 0.0
         cjk_seconds = cjk_char_count / ESTIMATED_QWEN3_CJK_CHARS_PER_SECOND if cjk_char_count else 0.0
+        spelled_char_count = len(SPELLED_CHARACTER_PATTERN.findall(text))
+        spelled_seconds = spelled_char_count / ESTIMATED_QWEN3_SPELLED_CHARS_PER_SECOND if spelled_char_count else 0.0
         punctuation_count = sum(unicodedata.category(ch).startswith("P") for ch in text)
         punctuation_seconds = punctuation_count * QWEN3_PUNCTUATION_PAUSE_SECONDS
         estimated_seconds = (
-            max(word_seconds, char_seconds, cjk_seconds) + punctuation_seconds + QWEN3_BASE_PROMPT_SECONDS
+            max(word_seconds, char_seconds, cjk_seconds, spelled_seconds)
+            + punctuation_seconds
+            + QWEN3_BASE_PROMPT_SECONDS
         )
-        estimated_tokens = math.ceil(estimated_seconds * MLX_STREAMING_TOKENS_PER_SECOND * QWEN3_TOKEN_SAFETY_MARGIN)
-        aligned_tokens = max(
-            chunk_size,
-            math.ceil(estimated_tokens / chunk_size) * chunk_size,
+        estimated_tokens = estimated_seconds * MLX_STREAMING_TOKENS_PER_SECOND
+        aligned_tokens = self._align_to_chunk(estimated_tokens * QWEN3_TOKEN_SAFETY_MARGIN, chunk_size)
+        # MIN_QWEN3_TTS_UTTERANCE_TOKENS keeps a low estimate from starving a real
+        # utterance. On a model that never emits EOS it is also the runaway budget: the
+        # 2-4 character opening interjection japanese_segmenter releases first ("うん、",
+        # estimated at 1.9s) was handed 28.8s and CustomVoice used every token of it,
+        # because a preset speaker has no acoustic reference to anchor the decode the way
+        # a voice-clone prompt does. Apply the floor only as far as this text could
+        # plausibly need it, so it still holds wherever 360 tokens is credible speech.
+        plausible_max_tokens = max(
+            MIN_QWEN3_TTS_RUNAWAY_TOKENS,
+            self._align_to_chunk(estimated_tokens * QWEN3_RUNAWAY_ESTIMATE_MULTIPLE, chunk_size),
         )
-        requested_tokens = max(MIN_QWEN3_TTS_UTTERANCE_TOKENS, aligned_tokens)
+        utterance_floor = min(MIN_QWEN3_TTS_UTTERANCE_TOKENS, plausible_max_tokens)
+        requested_tokens = max(aligned_tokens, utterance_floor)
         resolved_tokens = min(configured_cap, requested_tokens)
 
         if resolved_tokens < requested_tokens:
