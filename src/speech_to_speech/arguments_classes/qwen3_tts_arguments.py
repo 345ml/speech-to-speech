@@ -85,6 +85,12 @@ class Qwen3TTSHandlerArguments:
         default="I'm confused why some people have super short timelines, yet at the same time are bullish on scaling up reinforcement learning atop LLMs. If we're actually close to a human-like learner, then this whole approach of training on verifiable outcomes.",
         metadata={"help": "Transcription of the reference audio for voice cloning."},
     )
+    qwen3_tts_emotion_refs: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Optional path to a JSON manifest mapping voice slots ('平', '喜', '哀', '怒', '驚', '優', '相槌') to {'audio': path, 'text': transcription}. The language model picks the emotion slot with a leading [tag]; the opening backchannel of a turn uses '相槌'. Relative audio paths resolve against the manifest's directory. The manifest must define '平', which every other slot falls back to. When unset, qwen3_tts_ref_audio/qwen3_tts_ref_text are used for every utterance."
+        },
+    )
     qwen3_tts_speaker: Optional[str] = field(
         default="Aiden",
         metadata={

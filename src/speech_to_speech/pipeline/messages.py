@@ -146,6 +146,9 @@ class LLMResponseChunk(PipelineMessage):
     parts: list[AssistantOutputPart] = Field(default_factory=list)
     text: str = ""
     language_code: Optional[str] = None
+    # Which reference voice the TTS should clone for this chunk. Set from the model's
+    # emotion tag, or to the aizuchi slot for the short reaction that opens a turn.
+    voice_slot: Optional[str] = None
     tools: list[ResponseFunctionToolCall] = Field(default_factory=list)
     runtime_config: RuntimeConfig | None = None
     response: RealtimeResponseCreateParams | None = None
@@ -203,6 +206,7 @@ class TTSInput(PipelineMessage):
     tag: Literal["tts_input"] = "tts_input"
     text: str
     language_code: Optional[str] = None
+    voice_slot: Optional[str] = None
     runtime_config: RuntimeConfig | None = None
     response: RealtimeResponseCreateParams | None = None
     turn_id: str | None = None
