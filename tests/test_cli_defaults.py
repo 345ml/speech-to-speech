@@ -493,3 +493,47 @@ def test_parse_arguments_all_fields_populated():
         assert isinstance(value, EXPECTED_FIELD_TYPES[f.name]), (
             f"Field {f.name!r}: expected {EXPECTED_FIELD_TYPES[f.name].__name__}, got {type(value).__name__}"
         )
+
+
+def test_talk_disables_typed_text_input_by_default():
+    assert parse_talk_arguments([]).text_input is False
+
+
+def test_talk_accepts_typed_text_input():
+    assert parse_talk_arguments(["--text-input"]).text_input is True
+
+
+@pytest.mark.parametrize(
+    "flag",
+    ["--text-input", "--local_audio_text_input", "--local-audio-text-input"],
+)
+def test_local_accepts_typed_text_input(flag):
+    args = parse_arguments([flag], command="local")
+
+    assert args.local_audio_kwargs.local_audio_text_input is True
+
+
+def test_local_disables_typed_text_input_by_default():
+    args = parse_arguments([], command="local")
+
+    assert args.local_audio_kwargs.local_audio_text_input is False
+
+
+def test_serve_rejects_typed_text_input():
+    with pytest.raises(ValueError, match="--local_audio_text_input"):
+        parse_arguments(["--local_audio_text_input"], command="serve")
+
+
+def test_talk_fails_fast_when_prompt_toolkit_is_missing(monkeypatch):
+    """Better to fail at argument parsing than after a multi-minute warmup."""
+
+    from speech_to_speech.api.openai_realtime.text_input import TextInputUnavailable
+
+    monkeypatch.setitem(sys.modules, "prompt_toolkit", None)
+    with pytest.raises(TextInputUnavailable, match="prompt_toolkit"):
+        parse_talk_arguments(["--text-input"])
+
+
+def test_talk_without_text_input_does_not_need_prompt_toolkit(monkeypatch):
+    monkeypatch.setitem(sys.modules, "prompt_toolkit", None)
+    assert parse_talk_arguments([]).text_input is False

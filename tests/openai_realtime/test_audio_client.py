@@ -1354,3 +1354,116 @@ def test_talk_client_uses_signal_driven_shutdown(monkeypatch):
         (signal.SIGINT, "previous-SIGINT"),
         (signal.SIGTERM, "previous-SIGTERM"),
     ]
+
+
+async def test_typed_text_input_joins_the_audio_session(monkeypatch):
+    """The prompt runs alongside the microphone and is torn down with it."""
+
+    class FakeStream:
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sounddevice",
+        SimpleNamespace(
+            RawInputStream=lambda **_kwargs: FakeStream(),
+            RawOutputStream=lambda **_kwargs: FakeStream(),
+        ),
+    )
+
+    sent = []
+    events = []
+
+    class FakeTerminal:
+        def __init__(self):
+            self.console = audio_client_module.StdoutConsole()
+            self._lines = ["こんにちは"]
+
+        def activate(self):
+            events.append("activate")
+
+        def deactivate(self):
+            events.append("deactivate")
+
+        async def read_line(self):
+            if self._lines:
+                return self._lines.pop(0)
+            raise EOFError
+
+    terminal = FakeTerminal()
+    monkeypatch.setattr(audio_client_module, "create_text_terminal", lambda _config: terminal)
+
+    class FakeConnection:
+        async def send(self, event):
+            sent.append(event)
+
+        async def recv(self):
+            await asyncio.sleep(3600)
+
+    await audio_client_module._run_audio_session(
+        FakeConnection(),
+        RealtimeAudioClientConfig(text_input=True),
+        Event(),
+    )
+
+    assert events == ["activate", "deactivate"]
+    assert [event["type"] for event in sent] == [
+        "response.cancel",
+        "conversation.item.create",
+        "response.create",
+    ]
+    assert sent[1]["item"]["content"][0]["text"] == "こんにちは"
+
+
+async def test_audio_session_without_typed_input_creates_no_terminal(monkeypatch):
+    class FakeStream:
+        def start(self):
+            return None
+
+        def stop(self):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "sounddevice",
+        SimpleNamespace(
+            RawInputStream=lambda **_kwargs: FakeStream(),
+            RawOutputStream=lambda **_kwargs: FakeStream(),
+        ),
+    )
+
+    created = []
+
+    def track(config):
+        created.append(config)
+        return None
+
+    monkeypatch.setattr(audio_client_module, "create_text_terminal", track)
+
+    class FakeConnection:
+        async def send(self, event):
+            return None
+
+        async def recv(self):
+            await asyncio.sleep(3600)
+
+    stop_event = Event()
+    stop_event.set()
+    await audio_client_module._run_audio_session(
+        FakeConnection(),
+        RealtimeAudioClientConfig(),
+        stop_event,
+    )
+
+    assert len(created) == 1
+    assert created[0].text_input is False

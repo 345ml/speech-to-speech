@@ -27,6 +27,13 @@ from jsonschema import SchemaError, ValidationError
 from jsonschema.validators import validator_for
 from openai import AsyncOpenAI
 
+from .console import ConsoleSink, StdoutConsole
+from .text_input import (
+    TextInputCoordinator,
+    TextTurnSubmitter,
+    create_text_terminal,
+)
+
 logger = logging.getLogger(__name__)
 
 _AssistantTranscriptStream = tuple[str | None, str | None, int | None, int | None]
@@ -57,6 +64,7 @@ class RealtimeAudioClientConfig:
     instructions: Optional[str] = None
     voice: Optional[str] = None
     print_json: bool = False
+    text_input: bool = False
     block_mic_during_playback: bool = False
     connection_retry_timeout_s: float = 30.0
     tools: list[dict[str, Any]] = field(default_factory=list)
@@ -238,29 +246,22 @@ class PlaybackBuffer:
 
 
 class _FriendlyEventRenderer:
-    def __init__(self) -> None:
+    def __init__(self, console: ConsoleSink | None = None) -> None:
         # Input transcription events can arrive out of order across items.
         self.user_transcript_by_item: dict[str | None, str] = {}
-        self.live_user_width = 0
+        self.console: ConsoleSink = console if console is not None else StdoutConsole()
         self.saw_user_speech = False
         self.live_assistant_stream: _AssistantTranscriptStream | None = None
         self.streamed_assistant_transcripts: set[_AssistantTranscriptStream] = set()
 
+    def line(self, text: str) -> None:
+        self.console.line(text)
+
     def render_live_user_text(self, text: str, *, final: bool = False) -> None:
-        line = f"USER: {text}"
-        padded = line + (" " * max(0, self.live_user_width - len(line)))
-        if final:
-            print(f"\r{padded}", flush=True)
-            self.live_user_width = 0
-            return
-        print(f"\r{padded}", end="", flush=True)
-        self.live_user_width = len(line)
+        self.console.transient(f"USER: {text}", final=final)
 
     def clear_live_user_text(self) -> None:
-        if self.live_user_width == 0:
-            return
-        print("\r" + (" " * self.live_user_width) + "\r", end="", flush=True)
-        self.live_user_width = 0
+        self.console.clear_transient()
 
     @staticmethod
     def _assistant_stream_key(event: Any) -> _AssistantTranscriptStream:
@@ -282,10 +283,10 @@ class _FriendlyEventRenderer:
             delta = delta.lstrip()
             if not delta:
                 return
-            print("ASSISTANT: ", end="", flush=True)
+            self.console.stream("ASSISTANT: ")
             self.live_assistant_stream = stream_key
         self.streamed_assistant_transcripts.add(stream_key)
-        print(delta, end="", flush=True)
+        self.console.stream(delta)
 
     def render_assistant_text_done(self, event: Any) -> None:
         stream_key = self._assistant_stream_key(event)
@@ -296,11 +297,11 @@ class _FriendlyEventRenderer:
             return
         self.clear_live_user_text()
         self.finish_live_assistant_text()
-        print(f"ASSISTANT: {event.transcript or ''}", flush=True)
+        self.console.line(f"ASSISTANT: {event.transcript or ''}")
 
     def finish_live_assistant_text(self) -> None:
         if self.live_assistant_stream is not None:
-            print("", flush=True)
+            self.console.end_stream()
             self.live_assistant_stream = None
 
     def reset_assistant_text(self) -> None:
@@ -326,18 +327,18 @@ def handle_server_event(
     if print_json:
         renderer.finish_live_assistant_text()
         try:
-            print(f"EVENT: {event.model_dump_json()}", flush=True)
+            renderer.line(f"EVENT: {event.model_dump_json()}")
         except Exception:
-            print(f"EVENT: {event}", flush=True)
+            renderer.line(f"EVENT: {event}")
 
     if event.type == "session.created":
         renderer.finish_live_assistant_text()
-        print("Connected.", flush=True)
+        renderer.line("Connected.")
     elif event.type == "input_audio_buffer.speech_started":
         renderer.finish_live_assistant_text()
         playback.clear()
         if renderer.saw_user_speech:
-            print("", flush=True)
+            renderer.line("")
         renderer.saw_user_speech = True
     elif event.type == "input_audio_buffer.speech_stopped":
         return
@@ -358,39 +359,40 @@ def handle_server_event(
     elif event.type == "response.created":
         renderer.clear_live_user_text()
         renderer.finish_live_assistant_text()
-        print("ASSISTANT: <response started>", flush=True)
-    elif event.type in {"response.output_item.added", "response.output_item.done"}:
+        renderer.line("ASSISTANT: <response started>")
+    elif event.type in {
+        "response.output_item.added",
+        "response.output_item.done",
+        "conversation.item.created",
+    }:
         return
     elif event.type == "response.output_audio.delta":
         playback.append(base64.b64decode(event.delta))
     elif event.type == "response.output_audio.done":
         renderer.finish_live_assistant_text()
-        print("ASSISTANT: <audio done>", flush=True)
+        renderer.line("ASSISTANT: <audio done>")
     elif event.type == "response.output_audio_transcript.delta":
         renderer.render_assistant_text_delta(event)
     elif event.type == "response.output_audio_transcript.done":
         renderer.render_assistant_text_done(event)
     elif event.type == "response.function_call_arguments.done":
         renderer.finish_live_assistant_text()
-        print(
-            f"TOOL: {event.name} call_id={event.call_id} arguments={event.arguments}",
-            flush=True,
-        )
+        renderer.line(f"TOOL: {event.name} call_id={event.call_id} arguments={event.arguments}")
     elif event.type == "response.done":
         renderer.finish_assistant_response(getattr(event.response, "id", None))
         if event.response.status == "cancelled":
             playback.clear()
-        print(f"ASSISTANT: <response {event.response.status}>", flush=True)
+        renderer.line(f"ASSISTANT: <response {event.response.status}>")
     elif event.type == "output_audio_buffer.cleared":
         playback.clear()
     elif event.type == "error":
         renderer.clear_live_user_text()
         renderer.finish_live_assistant_text()
-        print(f"ERROR: {event.error.type}: {event.error.message}", flush=True)
+        renderer.line(f"ERROR: {event.error.type}: {event.error.message}")
     else:
         renderer.clear_live_user_text()
         renderer.finish_live_assistant_text()
-        print(f"EVENT: {event.type}", flush=True)
+        renderer.line(f"EVENT: {event.type}")
 
 
 @dataclass(frozen=True)
@@ -425,8 +427,15 @@ class _ToolCoordinatorError(RuntimeError):
 class _ToolCallCoordinator:
     """Execute declared tools without blocking event reception or racing responses."""
 
-    def __init__(self, conn: Any, config: RealtimeAudioClientConfig) -> None:
+    def __init__(
+        self,
+        conn: Any,
+        config: RealtimeAudioClientConfig,
+        *,
+        console: ConsoleSink | None = None,
+    ) -> None:
         self._conn = conn
+        self._console: ConsoleSink = console if console is not None else StdoutConsole()
         self._executor = config.tool_executor
         self._tool_validators = _validate_tool_config(config.tools, self._executor)
         self._default_create_response = config.tool_response_create
@@ -529,7 +538,7 @@ class _ToolCallCoordinator:
         except Exception as exc:
             message = f"{type(exc).__name__}: {exc}"
             logger.debug("Local tool %s failed", display_name, exc_info=True)
-            print(f"TOOL ERROR: {display_name} call_id={call_id}: {message}", flush=True)
+            self._console.line(f"TOOL ERROR: {display_name} call_id={call_id}: {message}")
             output = json.dumps({"error": message})
             create_response = True
         return _ToolExecutionResult(call_id=call_id, output=output, create_response=create_response)
@@ -596,7 +605,7 @@ class _ToolCallCoordinator:
     def _schedule_call(self, response_id: str, call: Any) -> None:
         call_id = getattr(call, "call_id", None)
         if not isinstance(call_id, str) or not call_id:
-            print("TOOL ERROR: received a call without call_id; cannot return an output", flush=True)
+            self._console.line("TOOL ERROR: received a call without call_id; cannot return an output")
             return
         batch = self._batch(response_id)
         if call_id in batch.call_ids:
@@ -799,8 +808,17 @@ async def _run_audio_session(
 
     mic_queue: Queue[bytes] = Queue(maxsize=128)
     playback = PlaybackBuffer(config.recv_rate)
-    renderer = _FriendlyEventRenderer()
-    tool_calls = _ToolCallCoordinator(conn, config)
+    text_terminal = create_text_terminal(config)
+    console: ConsoleSink = text_terminal.console if text_terminal is not None else StdoutConsole()
+    renderer = _FriendlyEventRenderer(console)
+    tool_calls = _ToolCallCoordinator(conn, config, console=console)
+    text_input: TextInputCoordinator | None = None
+    if text_terminal is not None:
+        text_input = TextInputCoordinator(
+            terminal=text_terminal,
+            submitter=TextTurnSubmitter(conn, playback=playback, console=console),
+            stop_event=stop_event,
+        )
 
     def callback_recv(outdata: Any, _frames: int, _time_info: Any, status: Any) -> None:
         if status:
@@ -844,6 +862,8 @@ async def _run_audio_session(
     opened_streams: list[Any] = []
     started_streams: list[Any] = []
     try:
+        if text_terminal is not None:
+            text_terminal.activate()
         input_stream = sd.RawInputStream(
             samplerate=config.send_rate,
             channels=1,
@@ -873,6 +893,8 @@ async def _run_audio_session(
             asyncio.create_task(_wait_for_stop(stop_event)),
             asyncio.create_task(tool_calls.wait_for_failure()),
         }
+        if text_input is not None:
+            tasks.add(asyncio.create_task(text_input.run()))
 
         done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         stop_event.set()
@@ -884,9 +906,18 @@ async def _run_audio_session(
                 raise task.exception()  # type: ignore[misc]
     finally:
         stop_event.set()
-        await tool_calls.close()
+        # Flush the renderer while the pinned prompt is still up, then hand the
+        # terminal back before any unbounded await. `tool_calls.close()` waits
+        # on tool tasks that may refuse to die, and a shell left in raw mode
+        # with stdout still patched is much worse than a lost log line.
         renderer.clear_live_user_text()
         renderer.reset_assistant_text()
+        if text_terminal is not None:
+            try:
+                text_terminal.deactivate()
+            except Exception:
+                logger.exception("Failed to restore the terminal after typed input")
+        await tool_calls.close()
         for stream in reversed(started_streams):
             try:
                 stream.stop()
@@ -930,6 +961,11 @@ async def listen_and_play_realtime(
                 raise
             except Exception as exc:
                 if stop_event.is_set():
+                    # The session's own teardown sets stop_event, so this branch
+                    # also absorbs genuine failures (a dead socket mid-send, for
+                    # one). Keep the exception recoverable at debug level rather
+                    # than logging every clean shutdown as an error.
+                    logger.debug("Realtime session ended with an exception", exc_info=True)
                     return
                 if connected or time.monotonic() - retry_started >= config.connection_retry_timeout_s:
                     raise

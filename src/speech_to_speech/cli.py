@@ -10,6 +10,7 @@ from speech_to_speech.api.openai_realtime.audio_client import (
     load_realtime_tool_module,
     run_realtime_audio_client,
 )
+from speech_to_speech.api.openai_realtime.text_input import check_text_input_support
 
 Command = Literal["serve", "talk", "local"]
 
@@ -130,6 +131,12 @@ def parse_talk_arguments(argv: Sequence[str]) -> RealtimeAudioClientConfig:
     )
     parser.add_argument("--print-json", action="store_true", default=defaults.print_json)
     parser.add_argument(
+        "--text-input",
+        action="store_true",
+        default=defaults.text_input,
+        help="Type turns alongside speaking. Requires a terminal and prompt_toolkit.",
+    )
+    parser.add_argument(
         "--block-mic-during-playback",
         action="store_true",
         default=defaults.block_mic_during_playback,
@@ -141,6 +148,8 @@ def parse_talk_arguments(argv: Sequence[str]) -> RealtimeAudioClientConfig:
         help="Seconds to wait for the Realtime endpoint to become available.",
     )
     namespace = parser.parse_args(list(argv))
+    if namespace.text_input:
+        check_text_input_support()
     tools: list[dict[str, Any]] = []
     tool_executor = None
     tool_response_create = defaults.tool_response_create
@@ -158,6 +167,7 @@ def parse_talk_arguments(argv: Sequence[str]) -> RealtimeAudioClientConfig:
         instructions=namespace.instructions,
         voice=namespace.voice,
         print_json=namespace.print_json,
+        text_input=namespace.text_input,
         block_mic_during_playback=namespace.block_mic_during_playback,
         connection_retry_timeout_s=namespace.connection_retry_timeout,
         tools=tools,

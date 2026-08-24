@@ -589,6 +589,7 @@ def build_local_pipeline(args: ParsedArguments, stop_event: Event) -> ThreadMana
         RealtimeAudioClientConfig,
         load_realtime_tool_module,
     )
+    from speech_to_speech.api.openai_realtime.text_input import check_text_input_support
 
     local_audio = args.local_audio_kwargs
     tools: list[dict[str, Any]] = []
@@ -596,6 +597,9 @@ def build_local_pipeline(args: ParsedArguments, stop_event: Event) -> ThreadMana
     tool_response_create = True
     if local_audio.local_audio_tool_module:
         tools, tool_executor, tool_response_create = load_realtime_tool_module(local_audio.local_audio_tool_module)
+    if local_audio.local_audio_text_input:
+        # Fail before models load rather than after a multi-minute warmup.
+        check_text_input_support()
     server_manager = build_pipeline(args, stop_event, host="127.0.0.1")
     client = RealtimeAudioClient(
         stop_event,
@@ -606,6 +610,7 @@ def build_local_pipeline(args: ParsedArguments, stop_event: Event) -> ThreadMana
             input_device=local_audio.local_audio_input_device,
             output_device=local_audio.local_audio_output_device,
             print_json=local_audio.local_audio_print_json,
+            text_input=local_audio.local_audio_text_input,
             block_mic_during_playback=local_audio.local_audio_block_mic_during_playback,
             tools=tools,
             tool_executor=tool_executor,

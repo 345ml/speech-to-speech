@@ -71,6 +71,15 @@ flowchart LR
 | `response.create` | Trigger LLM generation. Supports per-response `instructions` and `tool_choice` overrides. |
 | `response.cancel` | Cancel the in-progress or queued response and re-enable listening. |
 
+The packaged Python client uses three of these together for typed input (`talk --text-input` /
+`local --text-input`): `response.cancel`, then `conversation.item.create` with an `input_text`
+user message, then `response.create`. The cancel is unconditional rather than gated on having
+seen `response.created`, because a speech-triggered response is queued (`response_pending`)
+before the client is told about it, and creating a response during that window is rejected as
+`conversation_already_has_active_response`. Cancelling with nothing in flight emits no events.
+Sending the item after the cancel matters too: `conversation.item.create` defers the item while
+a response is in progress, and cancelling clears that flag synchronously.
+
 ### Server -> Client
 
 | Event | Description |

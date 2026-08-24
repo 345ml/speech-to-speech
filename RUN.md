@@ -45,7 +45,13 @@ INIT_PROMPT='あなたはユーザーと同居している親しい相手です�
 # 即座に出ない。かつ _flush は " ".join(batch) でバッチを繋ぐので、日本語のクローズが
 # 半角スペースで連結される。レイテンシと出力品質の両方の理由で --stream_batch_sentences
 # を 1 にする。
+# --text-input で、話しかける代わりに打ち込める。マイクは開いたまま。
+# ASR は TTFA の最大要因(1,040ms / p50 2,154ms)で、幻聴もまだ残っている(下記「未解決」)。
+# 打った場合はその両方を丸ごと迂回する。返事は音声のまま。
+# 入力行はターミナル最下部に固定され、ログや文字起こしはその上を流れる。
+# プロンプトが raw mode を取るので、Ctrl-C / Ctrl-D は入力行で押せば終了する。
 ./.venv/bin/speech-to-speech local \
+  --text-input \
   --stt mlx-audio-whisper \
   --mlx_audio_whisper_model_name mlx-community/whisper-large-v3-turbo \
   --language ja \
@@ -67,6 +73,10 @@ INIT_PROMPT='あなたはユーザーと同居している親しい相手です�
 `--qwen3_tts_ref_text` は参照音声の書き起こしで、音声と一致していないと
 その内容が出力の頭に混ざる。既定値は無関係な英文なので、必ず指定する。
 
+打ち込んだターンは `response.cancel` → `conversation.item.create` → `response.create`
+の3イベントで送られる。サーバ側は元から対応していたので、変更は同梱クライアントだけ。
+喋っている最中に送ると即座に割り込む(声で割り込んだときと同じ挙動)。
+
 ## 未解決
 
 - **STT の幻聴（一部）** — 完全一致のブロックリストと2文字未満の除去は入った
@@ -75,6 +85,16 @@ INIT_PROMPT='あなたはユーザーと同居している親しい相手です�
   運ぶ配管が要る。L0-5(計測の拡張)で同じ配管を通す
 - **キリル文字・ハングルの混入** — 未対応。`--stt parakeet-tdt` との比較が先
 - **再生の途切れ** — 原因の切り分け中（`companion/phase0/FINDINGS-selfbargein.md`）
+- **打ち込み中に VAD が発火すると衝突する** — マイクは開いたままなので、打鍵音や
+  独り言で音声ターンが立つと `response.create` が
+  `conversation_already_has_active_response` で弾かれる。打った文は履歴に入るが
+  返事が来ない。`ERROR:` が1行出るだけ。直すなら入力行に文字がある間だけ
+  マイク送信を止める（`callback_send` を入力バッファの状態でゲートする）
+- **`--text-input` 時の Ctrl-C は既存の終了経路を通らない** — prompt_toolkit が
+  raw mode で ISIG を落とすので SIGINT が飛ばず、`s2s_pipeline.py` の
+  signal_handler が走らない。「終了しています」の表示が出ず、`ThreadManager.stop()`
+  の5秒 join 上限ではなく `wait()` の無制限 join になる。実際には各ハンドラが
+  0.1秒ポーリングで stop_event を見るので終了するが、詰まった段があると待ち続ける
 
 ## 解決済み
 
