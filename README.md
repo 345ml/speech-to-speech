@@ -198,6 +198,20 @@ or another compatible server, see
 
 The packaged client can opt in to local Python tools with `talk --tool-module <module>` or `local --tool-module <module>`. The module contract, programmatic API, and a Serper web-search example are documented in [Tool calling design](./src/speech_to_speech/api/openai_realtime/README.md#packaged-python-client-tools).
 
+### Typing instead of speaking
+
+Pass `--text-input` to `talk` or `local` to type a turn while the microphone stays live:
+
+```bash
+speech-to-speech local --text-input
+```
+
+An input line stays pinned to the bottom of the terminal while transcripts and logs scroll above it. Submitting a
+line interrupts whatever the assistant is currently saying, the same way speaking over it would, and the reply is
+spoken as usual. Because the prompt puts the terminal in raw mode, `Ctrl-C` and `Ctrl-D` at the prompt end the
+session. The flag needs a real terminal; when stdin or stdout is piped it logs a warning and continues with voice
+input only.
+
 ### Migrating from `--mode`
 
 `--mode` is deprecated and will stop working soon. During this migration window, `speech-to-speech --mode realtime` runs `speech-to-speech serve`, and `speech-to-speech --mode local` runs `speech-to-speech local`; both print a warning. All other mode values have been removed and exit with guidance to use the new commands.

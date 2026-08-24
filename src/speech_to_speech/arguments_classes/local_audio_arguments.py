@@ -33,3 +33,13 @@ class LocalAudioArguments:
         default=False,
         metadata={"help": "Print raw Realtime events received by the packaged local audio client."},
     )
+    local_audio_text_input: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Type turns alongside speaking. Keeps an input line pinned to the bottom of the "
+                "terminal; requires a terminal and prompt_toolkit."
+            ),
+            "aliases": ["--text-input"],
+        },
+    )

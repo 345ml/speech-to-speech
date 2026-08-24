@@ -222,6 +222,7 @@ def main() -> None:
         "onnxruntime",
         "openai",
         "PIL",
+        "prompt_toolkit",
         "scipy",
         "sounddevice",
         "torch",
