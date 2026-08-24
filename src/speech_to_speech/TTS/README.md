@@ -97,6 +97,7 @@ Behavior:
 - Supports MLX quantization overrides on Apple Silicon via `--qwen3_tts_mlx_quantization bf16|4bit|6bit|8bit`.
 - Keeps the existing voice-clone/custom-voice/voice-design handler flow intact.
 - Defaults to the CustomVoice model with speaker `Aiden`, so no reference audio is required. Voice-clone/base models can still use `--qwen3_tts_ref_audio`.
+- Clones a different reference clip per emotion when `--qwen3_tts_emotion_refs` names a manifest; without it every utterance uses the single `--qwen3_tts_ref_audio`.
 
 Install notes for Linux GGML:
 - The default PyPI `qwentts-cpp-python` wheel targets CUDA 12.8.
@@ -158,6 +159,26 @@ speech-to-speech serve \
 ```
 
 Raw `--qwen3_tts_ref_audio` and cached `--qwen3_tts_ref_spk`/`--qwen3_tts_ref_rvq` inputs are mutually exclusive. `.rvq` input requires both `.spk` and reference text.
+
+#### Per-emotion reference voices
+
+`--qwen3_tts_emotion_refs` points at a JSON manifest that gives each voice slot its own reference clip, so one utterance can be cloned from a delighted recording and the next from a consoling one:
+
+```json
+{
+  "平":   {"audio": "neutral.wav",  "text": "The transcript for this clip."},
+  "喜":   {"audio": "joy.wav",      "text": "..."},
+  "哀":   {"audio": "sorrow.wav",   "text": "..."},
+  "怒":   {"audio": "anger.wav",    "text": "..."},
+  "驚":   {"audio": "surprise.wav", "text": "..."},
+  "優":   {"audio": "gentle.wav",   "text": "..."},
+  "相槌": {"audio": "aizuchi.wav",  "text": "..."}
+}
+```
+
+The language model selects an emotion slot by opening its reply with a bracketed tag (`[喜]`); the tag is stripped before synthesis and never spoken. The `相槌` slot is not tag-selected — it is assigned to the short interjection that opens a Japanese turn, and only under `--stream_batch_sentences 1`. Relative `audio` paths resolve against the manifest's directory, and `平` must be defined because every undefined slot falls back to it.
+
+A manifest makes the handler take the voice-clone path even on a CustomVoice model. It supplies raw reference audio, so like `--qwen3_tts_ref_audio` it is mutually exclusive with cached `--qwen3_tts_ref_spk`/`--qwen3_tts_ref_rvq`. Any problem with the manifest fails at startup rather than silently degrading to one voice.
 
 Example for Apple Silicon using the default 6-bit MLX variant:
 

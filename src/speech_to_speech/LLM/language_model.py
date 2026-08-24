@@ -43,6 +43,7 @@ from speech_to_speech.LLM.chat import (
     make_user_message,
 )
 from speech_to_speech.LLM.compaction_prompt import CompactGenerateFn, build_compactor
+from speech_to_speech.LLM.emotion_tags import EmotionTagStripper
 from speech_to_speech.LLM.text_prompt import build_text_system_prompt
 from speech_to_speech.LLM.tool_call.function_call import extract_function_calls_from_text
 from speech_to_speech.LLM.tool_call.function_tool import FunctionTool
@@ -126,6 +127,34 @@ class _CancelCriteria(StoppingCriteria):
         return self._cancelled
 
 
+def _text_chunk(
+    ctx: "StreamContext",
+    text: str,
+    language_code: Optional[str],
+    runtime_config: RuntimeConfig | None,
+    response: RealtimeResponseCreateParams | None,
+    **extra: Any,
+) -> LLMResponseChunk:
+    """Build one spoken chunk, carrying the turn's voice slot.
+
+    Every text-bearing LLMResponseChunk this backend emits goes through here. Hand-built
+    chunks are how the voice slot came to be set on some and not others, which flipped
+    the cloned voice back to the default part-way through a reply.
+    """
+    return LLMResponseChunk(
+        text=text,
+        language_code=language_code,
+        voice_slot=ctx.emotion_tags.slot,
+        runtime_config=runtime_config,
+        response=response,
+        turn_id=ctx.turn_id,
+        turn_revision=ctx.turn_revision,
+        speech_stopped_at_s=ctx.speech_stopped_at_s,
+        cancel_generation=ctx.cancel_generation,
+        **extra,
+    )
+
+
 class StreamContext(BaseModel):
     """Mutable accumulator passed through ``_stream_tokens`` so the caller
     can read back generation state after the iterator is exhausted."""
@@ -137,6 +166,9 @@ class StreamContext(BaseModel):
     raw_generated_text: str = ""
     generated_text: str = ""
     printable_text: str = ""
+    # Strips the model's [emotion] tags before they can reach the TTS, and remembers
+    # the last one so chunks carry the voice slot the synthesiser should clone.
+    emotion_tags: EmotionTagStripper = Field(default_factory=EmotionTagStripper)
     tools: list[ResponseFunctionToolCall] = Field(default_factory=list)
     function_tools: list[FunctionTool] = Field(default_factory=list)
     block_regex: Optional[str] = None
@@ -328,16 +360,7 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
         text_only = not response_wants_audio(response)
 
         def text_chunk(text: str) -> LLMResponseChunk:
-            return LLMResponseChunk(
-                text=text,
-                language_code=language_code,
-                runtime_config=runtime_config,
-                response=response,
-                turn_id=ctx.turn_id,
-                turn_revision=ctx.turn_revision,
-                speech_stopped_at_s=ctx.speech_stopped_at_s,
-                cancel_generation=ctx.cancel_generation,
-            )
+            return _text_chunk(ctx, text, language_code, runtime_config, response)
 
         while ctx.enter_code and ctx.enter_code in printable_text:
             idx = printable_text.index(ctx.enter_code)
@@ -527,7 +550,10 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
             raw_text: str = token.text if hasattr(token, "text") else token
             ctx.raw_generated_text += raw_text
-            clean = raw_text if not wants_audio else remove_unspeechable(raw_text)
+            # remove_unspeechable keeps square brackets, so an emotion tag survives it
+            # and would be read aloud. Strip it first.
+            tagless_text = ctx.emotion_tags.feed(raw_text)
+            clean = tagless_text if not wants_audio else remove_unspeechable(tagless_text)
             ctx.generated_text += clean
             ctx.printable_text += clean
             chunks, ctx.tools, ctx.printable_text = self._process_printable_text(
@@ -544,6 +570,13 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 break
             yield from chunks
 
+        held = ctx.emotion_tags.flush()
+        if held:
+            # Never closed, so it was ordinary text rather than a tag.
+            held_clean = held if not wants_audio else remove_unspeechable(held)
+            ctx.generated_text += held_clean
+            ctx.printable_text += held_clean
+
         if ctx.sentence_batch and not ctx.interrupted:
             if ctx.printable_text.strip():
                 leftover = ctx.printable_text.strip()
@@ -553,15 +586,12 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 ctx.cancelled = True
                 logger.info("LLM generation cancelled (stale speculative turn)")
                 return
-            yield LLMResponseChunk(
-                text=" ".join(ctx.sentence_batch),
-                language_code=language_code,
-                runtime_config=runtime_config,
-                response=response,
-                turn_id=ctx.turn_id,
-                turn_revision=ctx.turn_revision,
-                speech_stopped_at_s=ctx.speech_stopped_at_s,
-                cancel_generation=ctx.cancel_generation,
+            yield _text_chunk(
+                ctx,
+                " ".join(ctx.sentence_batch),
+                language_code,
+                runtime_config,
+                response,
             )
             ctx.sentence_batch = []
 
@@ -691,15 +721,12 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
             trailing_chunk: LLMResponseChunk | None = None
             trailing_text = ctx.printable_text.strip() if response_wants_audio(response) else ctx.printable_text
             if turn_output_allowed and trailing_text:
-                trailing_chunk = LLMResponseChunk(
-                    text=remove_markdown(trailing_text) if response_wants_audio(response) else trailing_text,
-                    language_code=language_code,
-                    runtime_config=runtime_config,
-                    response=response,
-                    turn_id=ctx.turn_id,
-                    turn_revision=ctx.turn_revision,
-                    speech_stopped_at_s=ctx.speech_stopped_at_s,
-                    cancel_generation=ctx.cancel_generation,
+                trailing_chunk = _text_chunk(
+                    ctx,
+                    remove_markdown(trailing_text) if response_wants_audio(response) else trailing_text,
+                    language_code,
+                    runtime_config,
+                    response,
                     response_key=request.response_key,
                     prefetch_transaction=request.prefetch_transaction,
                 )

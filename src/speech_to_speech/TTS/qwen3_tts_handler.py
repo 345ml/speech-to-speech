@@ -42,6 +42,7 @@ from speech_to_speech.pipeline.messages import (
     TTSInput,
 )
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
+from speech_to_speech.TTS.emotion_refs import NO_EMOTION_REFS, EmotionRefTable, VoiceReference
 from speech_to_speech.utils.mlx_lock import MLXLockContext
 
 logger = logging.getLogger(__name__)
@@ -107,6 +108,12 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
       - Voice design (instruct prompt)
     """
 
+    #: Both are assigned by ``setup()``. Declared at class level so the attributes are
+    #: always present and mean "no manifest, no override" on a handler that skipped
+    #: ``setup()``.
+    emotion_refs: EmotionRefTable = NO_EMOTION_REFS
+    _session_voice_override: bool = False
+
     def setup(
         self,
         should_listen: Event,
@@ -123,6 +130,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         ref_spk: str | Path | None = None,
         ref_rvq: str | Path | None = None,
         ref_text: str = DEFAULT_REF_TEXT,
+        emotion_refs: str | Path | None = None,
         language: str = "auto",
         speaker: Optional[str] = "Aiden",
         instruct: Optional[str] = None,
@@ -145,6 +153,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.ref_spk = self._normalize_optional_path(ref_spk)
         self.ref_rvq = self._normalize_optional_path(ref_rvq)
         self.ref_text = ref_text
+        self.emotion_refs = EmotionRefTable.load(emotion_refs) if emotion_refs else NO_EMOTION_REFS
         self.language = self._normalize_language(language)
         self.speaker = speaker
         self.instruct = instruct
@@ -163,6 +172,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.gen_kwargs = gen_kwargs or {}
         self._mlx_ref_audio_cache: dict[str, Any] = {}
         self._mlx_temp_ref_audio_files: set[str] = set()
+        self._session_voice_override = False
 
         self.backend = "mlx" if platform == "darwin" else "faster_qwen3_tts"
         self.streaming_chunk_size = self._resolve_streaming_chunk_size(streaming_chunk_size)
@@ -338,6 +348,11 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             raise ValueError(
                 "qwen3_tts_ref_audio is mutually exclusive with cached qwen3_tts_ref_spk/qwen3_tts_ref_rvq references."
             )
+        if self.emotion_refs and has_cached_reference:
+            raise ValueError(
+                "qwen3_tts_emotion_refs supplies raw reference audio and is mutually exclusive with "
+                "cached qwen3_tts_ref_spk/qwen3_tts_ref_rvq references."
+            )
         if self.ref_rvq is not None and self.ref_spk is None:
             raise ValueError("qwen3_tts_ref_rvq requires qwen3_tts_ref_spk.")
         if self.ref_rvq is not None and not self.ref_text:
@@ -469,7 +484,27 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         return None
 
     def _has_voice_clone_reference(self) -> bool:
-        return bool(self.ref_audio or getattr(self, "ref_spk", None))
+        if self.ref_audio or getattr(self, "ref_spk", None):
+            return True
+        # A session voice override clears ref_audio precisely so a CustomVoice speaker
+        # takes the custom-voice path instead. The manifest must not resurrect cloning
+        # behind it -- _resolve_voice_reference would then hand the backend no clip.
+        return bool(self.emotion_refs) and not self._session_voice_override
+
+    def _resolve_voice_reference(self, voice_slot: Optional[str]) -> VoiceReference:
+        """The reference clip and transcription to clone for this utterance.
+
+        An explicit per-session voice from a Realtime client is a direct instruction and
+        outranks the emotion table; everything else falls back to the single reference
+        the handler was configured with, so an absent manifest reproduces the previous
+        single-voice behaviour exactly. ``audio`` is None on the GGML path, where
+        ref_spk/ref_rvq carry the voice instead of a clip.
+        """
+        if not self._session_voice_override:
+            reference = self.emotion_refs.resolve(voice_slot)
+            if reference is not None:
+                return reference
+        return VoiceReference(audio=self.ref_audio, text=self.ref_text)
 
     def _clear_cached_voice_reference(self) -> None:
         self.ref_spk = None
@@ -569,11 +604,13 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
 
             self.speaker = session_voice
             self.ref_audio = None
+            self._session_voice_override = True
             self._clear_cached_voice_reference()
             return
 
         if self._resolve_audio_path(session_voice) is not None:
             self.ref_audio = session_voice
+            self._session_voice_override = True
             self._clear_cached_voice_reference()
             return
 
@@ -593,6 +630,18 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                     self.model.warmup(prefill_len=100)
                 except Exception as e:
                     logger.warning("Qwen3-TTS backend warmup failed: %s", e)
+
+        if self.backend == "mlx":
+            # Normalise every emotion reference up front. Otherwise the first utterance
+            # in each slot pays for a decode and resample, and that cost lands on the
+            # reply where the voice changes -- exactly where a stall is most audible.
+            # faster-qwen3-tts caches references itself and is not warmed here, so on
+            # that backend the first use of each slot still pays for its own encode.
+            for reference in self.emotion_refs.references():
+                try:
+                    self._prepare_mlx_ref_audio(reference.audio)
+                except Exception as e:
+                    logger.warning("Could not pre-normalize reference audio %s: %s", reference.audio, e)
 
         try:
             for _ in self._warmup_process("Hello, this is a warmup."):
@@ -698,7 +747,8 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         else:
             raise ValueError(
                 "Qwen3-TTS Base model requires a voice-clone reference. "
-                "Provide qwen3_tts_ref_audio or qwen3_tts_ref_spk, or use a CustomVoice/VoiceDesign model."
+                "Provide qwen3_tts_ref_audio, qwen3_tts_ref_spk or qwen3_tts_emotion_refs, "
+                "or use a CustomVoice/VoiceDesign model."
             )
 
     def _resample_to_pipeline_sr(self, audio: np.ndarray, sr: int) -> np.ndarray:
@@ -817,6 +867,10 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                     break
                 if not same_response(next_item):
                     break
+                # Merging across slots would silently undo the split that gives the
+                # opening backchannel its own voice.
+                if next_item.voice_slot != current_input.voice_slot:
+                    break
                 if (
                     language_code is not None
                     and next_item.language_code is not None
@@ -875,7 +929,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
 
         try:
             if self._has_voice_clone_reference():
-                audio_iter = self._process_voice_clone(text)
+                audio_iter = self._process_voice_clone(text, tts_input.voice_slot)
             elif model_type == "custom_voice":
                 audio_iter = self._process_custom_voice(text)
             elif model_type == "voice_design":
@@ -883,7 +937,8 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             else:
                 raise ValueError(
                     "Qwen3-TTS Base model requires a voice-clone reference. "
-                    "Provide qwen3_tts_ref_audio or qwen3_tts_ref_spk, or use a CustomVoice/VoiceDesign model."
+                    "Provide qwen3_tts_ref_audio, qwen3_tts_ref_spk or qwen3_tts_emotion_refs, "
+                    "or use a CustomVoice/VoiceDesign model."
                 )
             first_audio = True
             for audio_chunk in audio_iter:
@@ -937,8 +992,9 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                 label=label,
             )
 
-    def _process_voice_clone(self, text: str) -> Iterator[bytes | np.ndarray]:
+    def _process_voice_clone(self, text: str, voice_slot: Optional[str] = None) -> Iterator[bytes | np.ndarray]:
         utterance_max_new_tokens = self._estimate_max_new_tokens(text)
+        reference = self._resolve_voice_reference(voice_slot)
         if self.backend == "mlx":
             if self.xvec_only:
                 logger.warning("mlx-audio Qwen3-TTS does not support xvec_only; ignoring it")
@@ -950,8 +1006,8 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
                 label="voice_clone_mlx",
                 max_tokens=utterance_max_new_tokens,
                 text=text,
-                ref_audio=self._prepare_mlx_ref_audio(self.ref_audio),
-                ref_text=self.ref_text,
+                ref_audio=self._prepare_mlx_ref_audio(reference.audio),
+                ref_text=reference.text,
                 lang_code=self.language,
             )
             return
@@ -960,10 +1016,10 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
             self.model.generate_voice_clone_streaming(
                 text=text,
                 language=self.language,
-                ref_audio=self.ref_audio,
+                ref_audio=reference.audio,
                 ref_spk=getattr(self, "ref_spk", None),
                 ref_rvq=getattr(self, "ref_rvq", None),
-                ref_text=self.ref_text,
+                ref_text=reference.text,
                 xvec_only=self.xvec_only,
                 chunk_size=self.streaming_chunk_size,
                 max_new_tokens=utterance_max_new_tokens,
@@ -1037,6 +1093,7 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         self.ref_audio = self._initial_ref_audio
         self.ref_spk = self._initial_ref_spk
         self.ref_rvq = self._initial_ref_rvq
+        self._session_voice_override = False
         logger.debug("Qwen3-TTS session state reset")
 
     def cleanup(self) -> None:

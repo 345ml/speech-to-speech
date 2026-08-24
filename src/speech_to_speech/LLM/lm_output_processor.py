@@ -211,6 +211,7 @@ class LMOutputProcessor(BaseHandler[LLMOut, TTSIn | PipelineEvent]):
             yield TTSInput(
                 text=part.text,
                 language_code=lm_output.language_code,
+                voice_slot=lm_output.voice_slot,
                 runtime_config=lm_output.runtime_config,
                 response=lm_output.response,
                 turn_id=lm_output.turn_id,
