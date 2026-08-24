@@ -65,8 +65,8 @@ INIT_PROMPT='あなたはユーザーと同居している親しい相手です�
   --qwen3_tts_model_name mlx-community/Qwen3-TTS-12Hz-1.7B-Base \
   --qwen3_tts_mlx_quantization 8bit \
   --qwen3_tts_gen_temperature 0 \
-  --qwen3_tts_ref_audio /Users/horota/Downloads/psychopass.wav \
-  --qwen3_tts_ref_text "ネットって、物を調理するための刃物とか、記録するための紙とか、そういうレベルのものじゃないですかね。いい悪いじゃない、そこにあるんだから受け入れる。" \
+  --qwen3_tts_ref_audio /Users/horota/Downloads/gotobun_sorrow.wav \
+  --qwen3_tts_ref_text "もう少しこのままで、未練ができちゃったから。不愛想で気が利かなくて意地悪。なんで、君なんだろうね。" \
   --qwen3_tts_language ja
 ```
 
