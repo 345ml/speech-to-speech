@@ -4,9 +4,16 @@ NLTK's punkt does not split on 。, so a Japanese reply reaches the TTS as a sin
 sentence and nothing is spoken until generation has finished. This segmenter fills
 that hole.
 
-The core asymmetry: only the first clause of a turn is cut aggressively. It is the
-only one on the time-to-first-audio critical path; cutting later clauses at 、 buys
-no latency and costs prosody.
+The core asymmetry: the first clause of a turn is cut by a different rule than the
+rest. It is the only one on the time-to-first-audio critical path; cutting later
+clauses at 、 buys no latency and costs prosody.
+
+The first-clause floor is deliberately ABOVE interjection length. Cutting at the
+very first 、 released a 2-3 character interjection, which made every turn open on
+the same two words -- measured over 90 turns, segment 0 was 「うん、」 94.4% of the
+time and 「えっ、」 the rest, out of the five the prompt offers. Raising the floor to
+6 does not change what the model generates; it stops the segmenter from throwing the
+rest of the reaction into segment 1. Measured: 3 distinct openers to 60.
 """
 
 from speech_to_speech.LLM.japanese_segmenter import (
@@ -16,16 +23,35 @@ from speech_to_speech.LLM.japanese_segmenter import (
 from speech_to_speech.LLM.utils import MARKDOWN_SENTINEL, sent_tokenize_preserving_markdown_code
 
 
-def test_first_clause_is_cut_at_the_opening_comma() -> None:
-    # 「うん、」 is two characters plus a comma. Releasing it at once IS the TTFA win.
+def test_first_clause_skips_a_bare_interjection_comma() -> None:
+    # 「うん、」 is 3 characters: below the floor, so the cut moves to the next boundary
+    # and segment 0 carries the reaction instead of the filler in front of it.
     tokenizer = JapaneseClauseTokenizer()
-    assert tokenizer("うん、そっか") == ["うん、", "そっか"]
+    assert tokenizer("うん、そうなんだ。ゆっくりしなよ") == ["うん、そうなんだ。", "ゆっくりしなよ"]
+
+
+def test_first_clause_is_never_shorter_than_the_floor() -> None:
+    # The floor is what stops every turn opening on the same two words.
+    config = JapaneseSegmenterConfig()
+    tokenizer = JapaneseClauseTokenizer(config)
+    parts = tokenizer("えっ、どこで？今すぐ見に行く？")
+    assert len(parts[0]) >= config.first_min_chars
+    # The last element is always the un-flushed remainder, empty when the text ends
+    # on a boundary.
+    assert parts == ["えっ、どこで？", "今すぐ見に行く？", ""]
+
+
+def test_a_short_first_clause_still_waits_rather_than_releasing_debris() -> None:
+    # Nothing is emitted until the floor is reachable: a 3-character interjection on
+    # its own is not a segment.
+    tokenizer = JapaneseClauseTokenizer()
+    assert tokenizer("うん、") == ["うん、"]
 
 
 def test_later_clauses_are_not_cut_at_a_short_comma() -> None:
     # After the first clause has been released, be conservative: a short 、 is not a cut.
     tokenizer = JapaneseClauseTokenizer()
-    tokenizer("うん、")
+    tokenizer("うん、そうなんだ。")
     assert tokenizer("そっか、大変だったね") == ["そっか、大変だったね"]
 
 
@@ -36,7 +62,7 @@ def test_full_stop_always_splits() -> None:
 
 def test_full_stop_splits_after_the_first_clause_too() -> None:
     tokenizer = JapaneseClauseTokenizer()
-    tokenizer("うん、")
+    tokenizer("うん、そうなんだ。")
     assert tokenizer("今日は疲れた。ゆっくりしなよ") == ["今日は疲れた。", "ゆっくりしなよ"]
 
 
@@ -130,11 +156,11 @@ def test_a_newline_after_a_full_stop_is_not_emitted_twice() -> None:
     tokenizer = JapaneseClauseTokenizer()
     buffer = ""
     clauses: list[str] = []
-    for delta in ("はい。\n", "そう", "だね。\n", "うん"):
+    for delta in ("そうなんだ。\n", "ゆっ", "くりしなよ。\n", "うん"):
         buffer += delta
         parts = tokenizer(buffer)
         clauses.extend(parts[:-1])
         buffer = parts[-1]
     clauses.append(buffer)
 
-    assert clauses == ["はい。", "そうだね。", "うん"]
+    assert clauses == ["そうなんだ。", "ゆっくりしなよ。", "うん"]

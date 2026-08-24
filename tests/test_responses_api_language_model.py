@@ -1691,9 +1691,12 @@ def test_japanese_clauses_are_joined_without_a_space():
     # between Japanese clauses is a character the TTS reads out.
     handler = _make_handler()
     handler.stream_batch_sentences = 2
+    # Three clauses, so a batch of two still leaves a second chunk. 「うん、」 alone is
+    # below the first-clause floor, so the opening clause runs to the 。 after it.
+    reply = "うん、そっか。大変だったね。ゆっくりしなよ。"
     streamed_events = [
-        _make_text_delta_event("うん、そっか。大変だったね。"),
-        _make_output_item_done_event(content="うん、そっか。大変だったね。"),
+        _make_text_delta_event(reply),
+        _make_output_item_done_event(content=reply),
     ]
     handler.client = SimpleNamespace(
         responses=SimpleNamespace(create=lambda **kwargs: _make_stream(streamed_events)),
@@ -1706,7 +1709,8 @@ def test_japanese_clauses_are_joined_without_a_space():
     # The first chunk is a two-clause batch: joined with "" it is exactly the source
     # text, where " ".join would have inserted a space the TTS reads.
     texts = [o.text for o in outputs if isinstance(o, LLMResponseChunk)]
-    assert texts == ["うん、そっか。", "大変だったね。"]
+    assert texts == ["うん、そっか。大変だったね。", "ゆっくりしなよ。"]
+    assert "".join(texts) == reply
 
 
 def test_english_sentences_are_still_joined_with_a_space():
