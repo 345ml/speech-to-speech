@@ -47,8 +47,8 @@ INIT_PROMPT='あなたはユーザーと同居している親しい相手です�
   --qwen3_tts_model_name mlx-community/Qwen3-TTS-12Hz-1.7B-Base \
   --qwen3_tts_mlx_quantization 8bit \
   --qwen3_tts_gen_temperature 0.9 \
-  --qwen3_tts_ref_audio /Users/horota/Downloads/gotobun_base.wav \
-  --qwen3_tts_ref_text "二人は似た者同士だから。（ふふふ。）でもね、今日はいつもと違う気がした。二人には仲良く喧嘩してほしいな。" \
+  --qwen3_tts_ref_audio /Users/horota/Downloads/gotobun_sorrow.wav \
+  --qwen3_tts_ref_text "もう少しこのままで。未練ができちゃったから。不愛想で、気が利かなくて、意地悪。なんで君なんだろうね。" \
   --qwen3_tts_language ja
 ```
 
