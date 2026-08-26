@@ -478,6 +478,29 @@ speech-to-speech serve \
     --responses_api_stream
 ```
 
+This backend also accepts sampling parameters, which the Responses API cannot take
+because it spells `max_tokens` as `max_output_tokens` and has no penalty parameters:
+`--responses_api_gen_temperature`, `_top_p`, `_frequency_penalty`, `_presence_penalty`,
+`_max_tokens`, `_seed`. Each is unset by default, which omits the key from the request
+and leaves whatever the server itself defaults to in force.
+
+### Assuming a language for unlabelled turns
+
+Only a transcription labels a turn's language, and a turn's language is what selects
+its sentence tokenizer. The session carries the last transcribed language forward to
+tool follow-ups and to `response.create` (which is how a typed turn arrives), but a
+session that is only ever typed to has nothing to inherit for its first turn, and
+`--stt none` sends audio straight to the model with no transcription at all.
+
+`--responses_api_default_language` sets the language to assume in those cases. It
+matters most for Japanese: without it the reply is tokenized by a splitter that does
+not treat 。 as a sentence end, so the whole reply reaches the TTS as a single sentence
+and nothing is spoken until generation finishes.
+
+```bash
+speech-to-speech serve --llm_backend chat-completions --responses_api_default_language ja
+```
+
 ### Fully Local
 
 Run the LLM in a separate llama.cpp process for the lowest-friction fully local setup, as shown in the [Reachy Mini local conversation guide](https://huggingface.co/blog/local-reachy-mini-conversation):

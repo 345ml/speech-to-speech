@@ -180,6 +180,10 @@ class ResponseHandler(RealtimeBaseHandler):
 
         request = GenerateResponseRequest(
             runtime_config=st.runtime_config,
+            # A follow-up speaks the same turn the tool call came out of, so it takes
+            # that turn's language. Nothing else supplies one here, and without it the
+            # reply is segmented as if the language were unknown.
+            language_code=st.speculative_user_language_code,
             turn_id=st.speculative_user_turn_id,
             turn_revision=st.speculative_user_turn_revision,
             speech_stopped_at_s=st.speculative_user_speech_stopped_at_s,
@@ -587,6 +591,12 @@ class ResponseHandler(RealtimeBaseHandler):
         request = GenerateResponseRequest(
             runtime_config=cfg,
             response=event.response,
+            # `response.create` carries no language: the Realtime protocol has no field
+            # for one, and a turn typed with --text-input arrives entirely through this
+            # path. Inheriting the last transcribed turn's language is the closest thing
+            # to the truth available here, and beats generating with none. Out-of-band
+            # responses take no turn state at all, language included.
+            language_code=None if out_of_band else st.speculative_user_language_code,
             turn_id=None if out_of_band else st.speculative_user_turn_id,
             turn_revision=None if out_of_band else st.speculative_user_turn_revision,
             speech_stopped_at_s=None if out_of_band else st.speculative_user_speech_stopped_at_s,

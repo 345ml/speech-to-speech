@@ -7,6 +7,7 @@ import logging
 import os
 import wave
 from abc import ABC, abstractmethod
+from collections import Counter, deque
 from collections.abc import Callable, Generator, Iterator
 from queue import Empty, Full, Queue
 from threading import BoundedSemaphore, Lock, Thread, current_thread
@@ -67,6 +68,11 @@ PREFETCH_PROVIDER_WORKER_LIMIT = 1
 PREFETCH_STREAM_QUEUE_MAXSIZE = 16
 PREFETCH_WORKER_ACQUIRE_TIMEOUT_S = 0.05
 PROVIDER_FAILURE_FALLBACK = "I'm having trouble responding right now. Please try again."
+# How many turns the lead-in tally looks back over, and how many distinct openings it
+# names. Long enough that a single repeat is not yet a pattern, short enough that a
+# collapse shows up inside one tuning session instead of being averaged out of it.
+RECENT_LEAD_IN_HISTORY = 12
+RECENT_LEAD_IN_TALLY_ENTRIES = 4
 
 
 # ── Normalised provider events ────────────────────────────────────────────────
@@ -133,10 +139,27 @@ class _GenState(BaseModel):
     pending: list[SupportedItem] = Field(default_factory=list)
     recorded_item_ids: set[str] = Field(default_factory=set)
     recorded_call_ids: set[str] = Field(default_factory=set)
-    clean_text: str = ""  # filtered text, kept only for the debug log
+    clean_text: str = ""  # filtered text; feeds the debug dump and the reply-shape length
+    # The turn's first flushed chunk. Under --stream_batch_sentences 1 on a Japanese
+    # turn that is exactly the opening clause the segmenter cut, which is the part
+    # _log_reply_shape watches for collapse.
+    lead_in: str = ""
     input_tokens: int = 0
     output_tokens: int = 0
     output_emitted: bool = False
+
+
+def _tools_enabled(req_tools: Any, req_tool_choice: Any) -> bool:
+    """Whether this turn actually has tools the model may call.
+
+    Deliberately broader than the local backend's test in ``LLM/language_model.py``,
+    which first filters to ``type == "function"``: that backend can only execute a
+    function tool, through its own text protocol, whereas these backends forward every
+    tool to the provider as-is. So a session carrying only non-function tools is a
+    tool session here and is not one there, and both answers are right for their
+    channel.
+    """
+    return bool(req_tools) and req_tool_choice != "none"
 
 
 class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
@@ -174,6 +197,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         audio_temperature: float = 0.0,
         audio_content_type: Literal["input_audio", "audio_url"] = "input_audio",
         audio_history_turns: int = 1,
+        default_language: Optional[str] = None,
         **_kwargs: Any,
     ) -> None:
         self.cancel_scope = cancel_scope
@@ -183,6 +207,14 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         self.stream_batch_sentences = max(1, stream_batch_sentences)
         self.enable_lang_prompt = enable_lang_prompt
         self.gen_kwargs = dict(gen_kwargs)
+        # The language to assume for a turn that arrives without one. Only a
+        # transcription carries a language; the session inherits it forward for tool
+        # follow-ups and typed turns (see RealtimeSessionState), but the first turn of
+        # a typed-only session has nothing to inherit. No language selects NLTK, which
+        # does not treat 。 as a sentence end -- exactly the failure
+        # LLM/japanese_segmenter.py exists to fix.
+        self.default_language = default_language or None
+        self._recent_lead_ins: deque[str] = deque(maxlen=RECENT_LEAD_IN_HISTORY)
         self.audio_max_tokens = audio_max_tokens
         self.audio_temperature = audio_temperature
         if audio_content_type not in {"input_audio", "audio_url"}:
@@ -304,7 +336,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
     @abstractmethod
     def _build_optional_kwargs(self, req_tools: Any, req_tool_choice: Any) -> dict[str, Any]:
-        """Build the per-request tools/tool_choice kwargs in the backend's shape."""
+        """Build the per-request kwargs -- tools/tool_choice, and sampling where the
+        backend supports it -- in the backend's shape."""
         ...
 
     # ── audio-input protocol hooks ───────────────────────────────────────────
@@ -320,9 +353,34 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         req_tool_choice: Any,
     ) -> dict[str, Any]:
         """Build audio request parameters in the selected backend's shape."""
-        kwargs = self._build_optional_kwargs(req_tools, req_tool_choice)
+        return self._apply_audio_budget(self._build_optional_kwargs(req_tools, req_tool_choice), response)
+
+    def _apply_audio_budget(self, kwargs: dict[str, Any], response: Any) -> dict[str, Any]:
+        """Resolve an audio turn's token ceiling and temperature.
+
+        Precedence, highest first: the client's per-response ``max_output_tokens``,
+        then an explicitly configured sampling value, then the audio-path defaults.
+        ``setdefault`` carries the middle rung -- ``_build_optional_kwargs`` also
+        returns whatever sampling the operator configured, and someone who chose a
+        temperature meant it for this path too. The client's own ceiling still
+        overrides, because a per-request limit is not a default to fall back on.
+
+        Only an integer ceiling is forwarded. ``max_output_tokens`` is typed
+        ``int | "inf" | None`` and the Realtime default is the string, which is
+        truthy: passing it through reaches the provider as ``max_tokens="inf"``, comes
+        back a 400, and the turn dies into PROVIDER_FAILURE_FALLBACK. "inf" means the
+        client set no ceiling, which is exactly what the fallbacks here are for.
+
+        Separate from ``_build_audio_optional_kwargs`` because the Responses backend
+        sends its audio turns over Chat Completions and so cannot reuse that method's
+        Responses-shaped kwargs -- but the precedence rule is the same for both, and
+        one rule with two implementations is one rule that will drift.
+        """
         max_tokens = getattr(response, "max_output_tokens", None) if response is not None else None
-        kwargs.setdefault("max_tokens", max_tokens or self.audio_max_tokens)
+        if isinstance(max_tokens, int) and not isinstance(max_tokens, bool) and max_tokens > 0:
+            kwargs["max_tokens"] = max_tokens
+        else:
+            kwargs.setdefault("max_tokens", self.audio_max_tokens)
         kwargs.setdefault("temperature", self.audio_temperature)
         return kwargs
 
@@ -495,16 +553,74 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             return True
         return self.speculative_turns.is_latest_after_reopen_grace(turn_id, turn_revision)
 
+    def on_session_end(self) -> None:
+        """Drop per-session state so the next conversation starts clean.
+
+        The handler outlives a session under ``speech-to-speech serve``, so without
+        this the lead-in tally for one connection is computed over another
+        connection's openings -- and prints one caller's words in the other's log.
+        """
+        self._recent_lead_ins.clear()
+
+    def _sampling_kwargs(self) -> dict[str, Any]:
+        """Sampling parameters to send with every request.
+
+        ``gen_kwargs`` is assembled by ``normalize_dataclass_config`` from every
+        ``gen_``-prefixed argument, so a key is present here whether or not anyone set
+        it. ``None`` is how an unset flag says so: the key is dropped and the provider's
+        own default stands. That is what keeps each knob inert until it is given a
+        value, and it is why the flags default to None rather than to a copy of
+        whatever llama-server happens to use today -- baking in a value would silently
+        override a server started with `--temp`.
+        """
+        return {name: value for name, value in self.gen_kwargs.items() if value is not None}
+
+    def _log_reply_shape(self, lead_in: str, clean_text: str) -> None:
+        """One line per spoken turn: how the reply opened, how long it ran, and how
+        often that same opening has come up lately.
+
+        One opening printed alone is unremarkable; only next to the last dozen is it
+        visible that the model has settled on one. That is the whole point -- the TTS
+        already prints every chunk it speaks, and it is exactly that per-chunk view
+        that lets a collapse go unnoticed.
+
+        Spoken turns only: a text-modality turn forwards deltas verbatim without ever
+        batching, so it has no lead-in to record and the early return below catches it.
+        With --stream_batch_sentences 1 on a Japanese turn the first flush is precisely
+        the opening clause the segmenter cut; elsewhere it is the first batch, which is
+        still the part of a reply a model is most likely to repeat verbatim.
+        """
+        lead_in = lead_in.strip()
+        if not lead_in:
+            return
+        self._recent_lead_ins.append(lead_in)
+        tally = ", ".join(
+            f"{value} x{count}"
+            for value, count in Counter(self._recent_lead_ins).most_common(RECENT_LEAD_IN_TALLY_ENTRIES)
+        )
+        logger.info(
+            "Reply shape: lead-in=%r chars=%d | last %d lead-ins: %s",
+            lead_in,
+            len(clean_text.strip()),
+            len(self._recent_lead_ins),
+            tally,
+        )
+
     def _apply_config(
         self,
         chat: Chat,
         instructions: Optional[str],
         wants_audio: bool = True,
+        *,
+        has_tools: bool = True,
     ) -> None:
-        if instructions:
-            builder = build_voice_system_prompt if wants_audio else build_text_system_prompt
-            full_instructions = builder(instructions)
-            chat.add_item(make_system_message(full_instructions))
+        if not instructions:
+            return
+        if wants_audio:
+            full_instructions = build_voice_system_prompt(instructions, has_tools=has_tools)
+        else:
+            full_instructions = build_text_system_prompt(instructions)
+        chat.add_item(make_system_message(full_instructions))
 
     # ── output helpers ──────────────────────────────────────────────────────--
 
@@ -605,7 +721,12 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             # so the first Japanese clause -- the one on the time-to-first-audio path --
             # reaches the TTS immediately only under `--stream_batch_sentences 1`.
             # Making the batch size depend on the clause index is deferred.
-            yield self._chunk(turn, text=sentence_separator.join(batch))
+            text = sentence_separator.join(batch)
+            # First non-empty flush wins. Not `output_emitted`, which a tool call
+            # emitted ahead of any text has already set.
+            if not state.lead_in:
+                state.lead_in = text
+            yield self._chunk(turn, text=text)
 
         for event in events:
             # Provider usage is billable even when cancellation rolls back the
@@ -683,6 +804,13 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                     logger.debug(f"Clean text: {state.clean_text}")
                     yield from _flush(sentence_batch)
             logger.info(f"Tools: {state.tools}")
+        # Outside `if not cancelled`: a turn the user talked over still had its opening
+        # spoken, and those are the very turns the tally is trying to characterise --
+        # dropping them biases it away from the signal. Out-of-band turns are excluded
+        # instead, because they run on a throwaway chat with their own instructions and
+        # are never spoken, so their openings say nothing about the persona.
+        if not is_out_of_band(turn.response):
+            self._log_reply_shape(state.lead_in, state.clean_text)
         return (
             not cancelled
             and not self._turn_is_cancelled(turn)
@@ -969,7 +1097,9 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
         else:
             active_chat = original_chat.copy()
 
-        language_code = request.language_code
+        # `or`, not `if is None`: STT reports "" for a turn it could not label, and an
+        # empty code picks the same wrong tokenizer that None does.
+        language_code = request.language_code or self.default_language
         instructions = (
             response.instructions
             if response is not None and response.instructions is not None
@@ -982,7 +1112,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             response.tool_choice if response and response.tool_choice else runtime_config.session.tool_choice
         )
         wants_audio = response_wants_audio(response)
-        self._apply_config(active_chat, instructions, wants_audio)
+        self._apply_config(active_chat, instructions, wants_audio, has_tools=_tools_enabled(req_tools, req_tool_choice))
         language_code, lang_name = resolve_auto_language(language_code)
         if lang_name and self.enable_lang_prompt:
             active_chat.add_item(make_user_message(f"Please reply to my message in {lang_name}."))
@@ -1090,7 +1220,8 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
                 return
         else:
             active_chat = original_chat.copy()
-        language_code = request.language_code
+        # See _process_audio for why this is `or` rather than `if is None`.
+        language_code = request.language_code or self.default_language
         instructions = (
             response.instructions
             if response is not None and response.instructions is not None
@@ -1103,7 +1234,7 @@ class BaseOpenAICompatibleHandler(BaseHandler[LLMIn, LLMOut], ABC):
             response.tool_choice if response and response.tool_choice else runtime_config.session.tool_choice
         )
         wants_audio = response_wants_audio(response)
-        self._apply_config(active_chat, instructions, wants_audio)
+        self._apply_config(active_chat, instructions, wants_audio, has_tools=_tools_enabled(req_tools, req_tool_choice))
         language_code, lang_name = resolve_auto_language(language_code)
         if lang_name and self.enable_lang_prompt:
             active_chat.add_item(make_user_message(f"Please reply to my message in {lang_name}."))

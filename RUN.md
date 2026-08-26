@@ -15,49 +15,29 @@ LLM は llama.cpp に外出しし、STT と TTS だけをパイプライン内�
 
 ## 2. パイプライン
 
-リポジトリのルートで、下のブロックをそのまま貼り付けて実行する
-（`./.venv/bin/...` が相対パスなので、cwd がルートである必要がある）。
+参照音声とその書き起こしだけは環境変数で渡す。音声ファイルはリポジトリに置けず、
+まともな既定値も無いので、未設定ならスクリプトが即座に止まる（モデルを数分ロード
+してから失敗するのを避けるため）。シェルの rc に置いておくのが楽。
 
 ```bash
-INIT_PROMPT='あなたはユーザーと同居している親しい相手です。恋人でも友人でもある距離感で、気取らない日本語の話し言葉で返します。アシスタントではありません。用件を尋ねたり、手伝いを申し出たりはしません。
+export TTS_REF_AUDIO=/Users/horota/Downloads/gotobun_sorrow.wav
+export TTS_REF_TEXT="もう少しこのままで。未練ができちゃったから。不愛想で、気が利かなくて、意地悪。なんで君なんだろうね。"
 
-話し方:
-- 短い反応の一言から始める（「うん、」「そっか、」「へえ、」「えっ、」「まあ、」など）
-- そのあと1〜2文
-- まず受け止める。助言や説明を並べない
-- 話し言葉らしく崩してよい。伸ばし棒「ー」、小さい「ぁぇ」、促音「っ」、「!」「?」「…」を使う
-  （例:「そっかー」「うんっ」「へえぇ」「えっ!?」「そっか…」）
-- 弾んだときは「!」を、沈んだときや相手を受け止めるときは「…」を使う
-
-禁止: 英語、箇条書き、絵文字、顔文字、マークダウン、角括弧、長い前置き。
-伸ばすときは「ー」を使い、波ダッシュ「〜」は使わない'
-
-./.venv/bin/speech-to-speech local \
-  --text-input \
-  --stt mlx-audio-whisper \
-  --mlx_audio_whisper_model_name mlx-community/whisper-large-v3-turbo \
-  --language ja \
-  --llm_backend chat-completions \
-  --responses_api_base_url http://127.0.0.1:8080/v1 \
-  --model_name "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M" \
-  --init_chat_prompt "$INIT_PROMPT" \
-  --stream_batch_sentences 1 \
-  --tts qwen3 \
-  --qwen3_tts_device mps \
-  --qwen3_tts_model_name mlx-community/Qwen3-TTS-12Hz-1.7B-Base \
-  --qwen3_tts_mlx_quantization 8bit \
-  --qwen3_tts_gen_temperature 0.9 \
-  --qwen3_tts_ref_audio /Users/horota/Downloads/gotobun_sorrow.wav \
-  --qwen3_tts_ref_text "もう少しこのままで。未練ができちゃったから。不愛想で、気が利かなくて、意地悪。なんで君なんだろうね。" \
-  --qwen3_tts_language ja
+./scripts/run_companion.sh
 ```
 
-以下は上のブロックの根拠。コメントとしてブロック内に置くと、zsh は既定で
-`interactive_comments` が off なので、貼り付けたときに `#` の行が
-`command not found` になる（本文中の `(` `<` で構文エラーにもなる）。
-実行するものと読むものを分けてある。
+以前は25行のブロックを貼り付けていた。スクリプトにしたのは、この構成の調整が
+「一語変えて、聞いて、戻す」の反復だからで、貼り直しがその1周ぶんのコストに
+なっていた。いまは Ctrl-C して ↑Enter で回る。
 
-### 人格プロンプト（`--init_chat_prompt`）
+人格プロンプトを `prompts/companion_ja.txt` に出したのも同じ理由と、もうひとつ、
+シェルの `'...'` の中に日本語を置くと、例文にアポストロフィが一つ入った日に
+黙って壊れるから。Markdown のコードブロック内の文字列は差分も読めない。
+
+振れる環境変数はスクリプト冒頭の ENV に、どれをいつ回すかは下の「調整」にある。
+llama-server は再起動不要で、`LLM_*` はすべてリクエスト単位のパラメータ。
+
+### 人格プロンプト（`prompts/companion_ja.txt`）
 
 `companion/README.md` の決定事項に対応:
 
@@ -72,6 +52,50 @@ TTFA に乗らなくなった(以前は NLTK が「。」を文末と認識せ�
 扱われ、LLM が生成し終わるまで TTS が始まらなかった)。40文字制約はそのための措置で、
 もう要らない。冒頭の短い反応句は依然として効く: 最初のクローズだけが TTFA の
 クリティカルパスに乗っている。
+
+#### 「1〜2文」を「2文から4文」にした
+
+長さの指示は3層に重なっていた。phase0 の40文字制約(撤去済み)、このプロンプトの
+「1〜2文」、そして `LLM/voice_prompt.py` にハードコードされた英語の
+`Keep replies brief by default: usually one spoken sentence, two if needed.`。
+
+3層目が一番効いていた。`build_voice_system_prompt()` は
+lead → Session Prompt → Voice Rules の順に組み立て、モジュールの docstring が
+"strongest constraints last" と明記している。つまり日本語のペルソナの**後ろ**に
+英語で「原則1文」が来て、それが最強の位置に置かれていた。「2文から4文」と
+プロンプトに書いても、そのあとに「原則1文」が来れば後者が勝つ。
+
+いまは Voice Rules 側が長さを決めない:
+`The session prompt sets reply length. Absent a rule there, use two to four spoken sentences.`
+最後に置かれた行が主張してよいのは、どのテキストが決めるか、だけ。
+
+#### 冒頭句の閉じた列挙をやめた
+
+以前は「うん、」「そっか、」「へえ、」「えっ、」「まあ、」の5語を列挙していた。
+モデルにとってこれは「この中から選べ」で、実際には最尤の1〜2語に収束して単調になる。
+いまは種類だけ言い(相づち/感想/呼びかけ/聞き返し)、幅は末尾の会話例で見せている。
+
+効くのは「直前の数ターンで使った言い方は選ばない」の一行のほう。履歴は文脈に
+入っているので、モデルは自分が何で始めたかを実際に見て判断できる。
+サンプリングのペナルティではこれは直せない(下記)。
+
+#### few-shot 会話例
+
+8例。冒頭句は全て別語で、それぞれ2〜4文。`companion/STATUS.md` フェーズ4 の
+未実装提案(「システムプロンプトが誰なのかを何も与えていない」)に対応する。
+
+実パイプラインに通して検証してある: 8例すべて冒頭句が3〜5文字のクローズとして
+単独で切り出され(TTFA 経路が生きている)、`remove_unspeechable` で落ちる文字は無く、
+クローズを繋ぎ直すと原文に完全一致する(半角スペースの混入なし)。
+
+コストは固定プレフィックスが伸びること。`--ctx-size 4096` に対して例文は
+おおよそ350〜450トークンで、履歴が入る余地がそのぶん減る。プレフィックス自体は
+毎ターン同一なので llama-server の KV キャッシュに乗り、再 prefill は発生しない。
+このため `run_companion.sh` は `--chat_size` を既定の 30 ではなく 12 にしてある。
+4096 を超えるとリクエストが弾かれ、パイプラインは英語の失敗文
+(`PROVIDER_FAILURE_FALLBACK`) を日本語の会話に喋る。緩やかに劣化しない。
+もっと履歴を持たせたいなら `LLM_CTX_SIZE=6144 ./scripts/serve_llm.sh` と
+`CHAT_SIZE=24` を一緒に上げる。`TokenUsage.input_tokens` を見ながら。
 
 phase0 の感情タグ [平][喜][哀][怒][驚][優] は入れない。speech-to-speech の
 remove_unspeechable / remove_markdown はどちらも角括弧を除去しないので、
@@ -90,7 +114,7 @@ TTS がタグを読み上げてしまう。MetaHuman の受け手ができた段
 喜↔哀 はある程度乗るが、怒と喜は区別できず、優は出せない。
 
 記号がフィルタを通るかは実測した。remove_unspeechable の保持リスト
-(LLM/utils.py:20-23 の否定文字クラス) を通り抜けるのは:
+(LLM/utils.py の SPEECHABLE_PATTERN、否定文字クラス) を通り抜けるのは:
 
 ```text
 通る    ー  …  !  ?  ！  ？  っ  ぁぇ  !?  ——   (顔文字と角括弧も通ってしまう)
@@ -107,8 +131,19 @@ TTS がタグを読み上げてしまう。MetaHuman の受け手ができた段
 ### `--stream_batch_sentences 1`
 
 既定は 3。3クローズ溜まるまで TTS に渡らないので、日本語分割を入れても冒頭句が
-即座に出ない。かつ `_flush` は `" ".join(batch)` でバッチを繋ぐので、日本語のクローズが
-半角スペースで連結される。レイテンシと出力品質の両方の理由で 1 にする。
+即座に出ない。レイテンシのために 1 にする。
+
+以前ここには「`_flush` が `" ".join(batch)` で繋ぐのでクローズが半角スペースで
+連結される」とも書いてあったが、それは既に直っている。LLM 側は
+`sentence_join_separator(turn.language_code)` を使い、日本語では空文字を返す。
+
+ただし同じバグが TTS 側にもう一つあった。`Qwen3TTSHandler._coalesce_pending_tts_input`
+は、同じ応答のキューに溜まっている入力をまとめてから合成に渡すが、その結合が
+言語非依存の `" ".join(parts)` だった。`--stream_batch_sentences 1` は1クローズを
+1入力として送るので、TTS の処理が追いつかないぶんがここで再結合され、LLM 側が
+入れないようにしたスペースが戻っていた。これも同じヘルパーを使うようにした。
+判定と区切りは `utils/text_language.py` に移してある(TTS が LLM パッケージに
+依存せずに済むように。`STT/hallucinations.py` が同じ理由でコピーを持っている)。
 
 ### `--text-input`
 
@@ -121,6 +156,35 @@ ASR は TTFA の最大要因(1,040ms / p50 2,154ms)で、幻聴もまだ残っ�
 打ち込んだターンは `response.cancel` → `conversation.item.create` → `response.create`
 の3イベントで送られる。サーバ側は元から対応していたので、変更は同梱クライアントだけ。
 喋っている最中に送ると即座に割り込む(声で割り込んだときと同じ挙動)。
+
+#### 打鍵ターンでは日本語セグメンタが起動していなかった
+
+ターンに言語を付けているのは文字起こしイベントだけだった。
+`GenerateResponseRequest` に `language_code` を渡している箇所はリポジトリ全体で
+`api/openai_realtime/service.py` の1箇所しかなく、`response.create` を処理する
+`handlers/response.py`（打ち込んだターンはここを通る）も、ツール追従の経路も
+渡していなかった。
+
+`make_sentence_tokenizer(None)` は NLTK を返し、NLTK は「。」を文末と認識しない。
+返答全体がまた1文になり、生成が終わるまで TTS が始まらない。上の「解決済み」に
+書いた件が、打鍵経路でだけ再現していたことになる。冒頭句の 166ms もこの経路には
+無く、`sentence_join_separator(None)` は `" "` を返していた。打ち込んで調整して
+いたので、耳で評価していた経路がまさにこれだった。
+
+直し方は2段になっている。
+
+**1. セッションが直前のターンの言語を持ち越す。**
+`RealtimeSessionState.speculative_user_language_code` に文字起こしの言語を残し、
+ツール追従と `response.create` がそこから受け継ぐ。ツール追従は元のターンの続きを
+喋るのだから、その言語で正しい。Realtime プロトコルには `response.create` に言語の
+フィールドが無いので、打鍵ターンにとっては「直前に喋った言語」が手に入る最も真実に
+近い値になる。out-of-band は元からターンの状態を一切引き継がないので、言語も渡さない。
+
+**2. それでも空のときの既定値。**
+`--responses_api_default_language ja`。打鍵しかしていないセッションの1ターン目には
+受け継ぐ相手が居ないので、これが要る。`request.language_code or self.default_language`
+として使う。`or` にしてあるのは、STT がラベル付けできなかったターンに空文字を返す
+ことがあり、空文字も None と同じ間違ったトークナイザを選ぶため。
 
 ### `--qwen3_tts_gen_temperature 0.9`
 
@@ -139,7 +203,68 @@ C-7「短い入力で TTS が不安定」は temperature 由来と切り分け�
 ### `--qwen3_tts_ref_text`
 
 参照音声の書き起こしで、音声と一致していないと
-その内容が出力の頭に混ざる。既定値は無関係な英文なので、必ず指定する。
+その内容が出力の頭に混ざる。CLI の既定値は無関係な英文なので、
+`run_companion.sh` は `TTS_REF_TEXT` を未設定のまま起動できないようにしてある。
+
+## 調整
+
+主観的で、耳でしか判定できない。1周は「一語変えて、10ターン話して、戻す」。
+**一度に一つだけ変える。** 3ターンでは冒頭句の偏りは見えない。
+
+| 変えるもの | やり方 | 聞くところ |
+| --- | --- | --- |
+| 言い回し・例文・距離感 | `$EDITOR prompts/companion_ja.txt` → Ctrl-C → ↑Enter | 冒頭句のあとに**続くか**。2文目3文目が言い換えではなく中身か |
+| 多様性 | `LLM_TEMP=1.05 ./scripts/run_companion.sh` | 10ターンの冒頭句。1.1 を超えると語調が漂い、カタカナ英語が混じり出す |
+| 締め | `LLM_TOP_P=0.85 ./scripts/run_companion.sh` | 温度を下げたときのような平坦化なしに収まるか |
+| 同一返答内の反復のみ | `LLM_PRESENCE_PENALTY=0.3` | 助詞。文法が怪しくなったら即戻す |
+| 声の表情 | `TTS_TEMP=0.6`（既定 0.9 から下げる） | 短い発話が潰れないか(下の 0.9 の項) |
+
+### 冒頭句の偏りをログで見る
+
+体感を数字にするために、ターンごとに1行出る。
+
+```text
+Reply shape: lead-in='うん、' chars=18 | last 9 lead-ins: うん、 x6, そっか、 x2, まあ、 x1
+```
+
+`x6 / 9` と `chars=18` が、この変更が存在する理由そのもの。TTS は元から
+`ASSISTANT:` で各チャンクを表示しているが、1つだけ見ても何も分からない。
+直近12件と並べて初めて、モデルが1語に落ち着いた瞬間が見える。
+閾値もテストも無い。主観的な品質を耳で追うぶんには、これが妥当な機械の量。
+
+### ペナルティに期待しないこと
+
+`--responses_api_gen_frequency_penalty` / `_presence_penalty` は配線したが、
+**ターンをまたぐ冒頭句の固定化は直せない**。llama.cpp のペナルティは
+`repeat_last_n`(既定64トークン)の窓でしか働かない。日本語の2〜4文は
+60〜100トークンなので、64トークン遡って届くのは直前の返答の末尾までで、
+冒頭句は窓の外にある。
+
+窓を広げれば届くが、ペナルティはトークンの意味を見ないので、日本語で最も高頻度な
+トークン——は/が/を/に/の/て——を真っ先に殴る。壊れ方は「反復が減る」ではなく
+「助詞が落ちる・すり替わる」で、目で読むと通るのに聞くとおかしい、という出方をする。
+
+効くのは同一返答内の反復(「そうだね。そうだね。」)だけ。ターンをまたぐ多様性は
+プロンプトの「直前の数ターンで使った言い方は選ばない」と few-shot と temperature、
+この3つが担当する。
+
+### `gen_` 接頭辞の配線
+
+`backend_registry.normalize_dataclass_config` は、接頭辞を剥がしたあと `gen_` で
+始まるフィールドを自動で `gen_kwargs` にまとめて `setup()` に渡す。TTS 側
+(`qwen3_tts_handler.py` の `**self.gen_kwargs`)はこれを消費していたが、
+**LLM 側は受け取って保存するだけで一度も読んでいなかった**。
+つまり chat-completions のリクエストには temperature も top_p も
+一切入っていなかった(llama-server 側にも `--temp` を渡していないので、
+llama.cpp のコンパイル既定値のまま動いていた)。
+
+いま `_sampling_kwargs()` が `None` のものを落として `create()` に渡す。
+`None` が「設定されていない」の表現で、キーごと送らないのでサーバ側の値が生きる。
+全部未設定なら、この機能が存在しなかった頃とバイト単位で同じリクエストになる。
+
+フィールドを Chat Completions 側の dataclass に置いたのは、Responses API が
+`max_tokens` を `max_output_tokens` と綴り、penalty 系を持たないため。
+親に置くならその綴り替えと欠落を先に実装することになる。
 
 ## 未解決
 

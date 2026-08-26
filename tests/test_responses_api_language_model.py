@@ -1,5 +1,6 @@
 import json
 import logging
+from collections import deque
 from queue import Queue
 from threading import BoundedSemaphore, Event, Lock, Thread
 from types import SimpleNamespace
@@ -159,6 +160,8 @@ def _make_handler(*, disable_thinking=False, stream=True, cancel_scope=None, rea
     handler.tools_choice = None
     handler.enable_lang_prompt = False
     handler.compactor = None
+    handler.default_language = None
+    handler._recent_lead_ins = deque(maxlen=base_openai_compatible_language_model.RECENT_LEAD_IN_HISTORY)
     handler.audio_max_tokens = 80
     handler.audio_temperature = 0.0
     handler.audio_content_type = "input_audio"

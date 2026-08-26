@@ -10,6 +10,7 @@ Run with pytest, or standalone:  python tests/test_chat_completions_backend.py
 from __future__ import annotations
 
 import json
+import logging
 import queue
 import threading
 from types import SimpleNamespace
@@ -31,6 +32,13 @@ from openai.types.responses import ResponseFunctionToolCall
 import speech_to_speech.LLM.base_openai_compatible_language_model as base_mod
 import speech_to_speech.LLM.chat_completions_language_model as ccm
 from speech_to_speech.api.openai_realtime.runtime_config import RuntimeConfig
+from speech_to_speech.arguments_classes.chat_completions_language_model_arguments import (
+    ChatCompletionsLanguageModelHandlerArguments,
+)
+from speech_to_speech.arguments_classes.responses_api_language_model_arguments import (
+    ResponsesApiLanguageModelHandlerArguments,
+)
+from speech_to_speech.backend_registry import normalize_dataclass_config
 from speech_to_speech.LLM.chat import Chat, make_user_audio_message, make_user_message
 from speech_to_speech.LLM.chat_completions_language_model import (
     ChatCompletionsApiModelHandler,
@@ -100,7 +108,7 @@ class _FakeClient:
         return self
 
 
-def _make_handler(stream=True, *, base_url="http://fake/v1", reasoning_effort=None):
+def _make_handler(stream=True, *, base_url="http://fake/v1", reasoning_effort=None, **setup_overrides):
     """Build a handler whose warmup hits the fake client (no network)."""
     orig_openai = base_mod.OpenAI
     base_mod.OpenAI = _FakeClient
@@ -117,6 +125,7 @@ def _make_handler(stream=True, *, base_url="http://fake/v1", reasoning_effort=No
                 disable_thinking=True,
                 reasoning_effort=reasoning_effort,
                 compact_history=False,
+                **setup_overrides,
             ),
         )
     finally:
@@ -150,6 +159,7 @@ def _drive(
     chat=None,
     response=None,
     instructions="Du bist ein Roboter.",
+    language_code="de",
 ):
     chat = chat or Chat(10)
     if user:
@@ -161,7 +171,7 @@ def _drive(
         session.tool_choice = tool_choice
     rc = RuntimeConfig(chat=chat, session=session)
     req = GenerateResponseRequest(
-        runtime_config=rc, response=response, language_code="de", turn_id="t", turn_revision=0
+        runtime_config=rc, response=response, language_code=language_code, turn_id="t", turn_revision=0
     )
     text, tools_out, usage, end = "", [], None, None
     for out in handler.process(req):
@@ -983,6 +993,237 @@ def test_out_of_band_does_not_commit_to_default_conversation():
     assert "Background note." in text
     # Default conversation keeps only the seeded user turn — no assistant commit.
     assert not any(getattr(i, "role", None) == "assistant" for i in chat.buffer)
+
+
+# ── Sampling parameters ───────────────────────────────────────────────────────
+
+
+def test_sampling_options_reach_the_request_and_unset_ones_are_omitted():
+    h = _make_handler(
+        stream=True,
+        gen_kwargs={"temperature": 0.85, "presence_penalty": 0.3, "top_p": None, "seed": None},
+    )
+    captured = {}
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return _FakeStream([_chunk(content="Hallo.")])
+
+    h.client.chat.completions.create = fake_create
+    _drive(h)
+
+    assert captured["temperature"] == 0.85
+    assert captured["presence_penalty"] == 0.3
+    # None is how an unset flag says so; the key must not reach the request at all,
+    # or the server's own default is overridden with a null.
+    assert "top_p" not in captured
+    assert "seed" not in captured
+
+
+def test_no_sampling_options_leaves_the_request_as_it_was():
+    """The flags are inert until one is set: this is the byte-identity guarantee."""
+    h = _make_handler(stream=True)
+    captured = {}
+
+    def fake_create(**kwargs):
+        captured.update(kwargs)
+        return _FakeStream([_chunk(content="Hallo.")])
+
+    h.client.chat.completions.create = fake_create
+    _drive(h)
+
+    assert not {"temperature", "top_p", "frequency_penalty", "presence_penalty", "max_tokens", "seed"} & set(captured)
+
+
+def test_sampling_flags_ride_the_gen_prefix_convention():
+    """No wiring code: backend_registry buckets `gen_`-prefixed fields on its own."""
+    config = normalize_dataclass_config(
+        ChatCompletionsLanguageModelHandlerArguments(responses_api_gen_temperature=0.85),
+        "responses_api",
+    )
+
+    assert config["gen_kwargs"]["temperature"] == 0.85
+    assert config["gen_kwargs"]["top_p"] is None
+    assert "gen_temperature" not in config and "temperature" not in config
+
+
+def test_the_responses_backend_declares_no_sampling_flags():
+    """They live on the Chat Completions child because Responses spells them differently."""
+    config = normalize_dataclass_config(ResponsesApiLanguageModelHandlerArguments(), "responses_api")
+
+    assert config["gen_kwargs"] == {}
+
+
+def test_configured_sampling_reaches_the_audio_path_but_a_per_response_ceiling_still_wins():
+    h = _make_handler(stream=False, gen_kwargs={"temperature": 0.85, "max_tokens": 512}, audio_max_tokens=80)
+
+    kwargs = h._build_audio_optional_kwargs(RealtimeResponseCreateParams(max_output_tokens=40), None, None)
+    assert kwargs["temperature"] == 0.85  # explicit beats the audio path's 0.0 default
+    assert kwargs["max_tokens"] == 40  # a per-request limit is not a default to fall back on
+
+    kwargs = h._build_audio_optional_kwargs(None, None, None)
+    assert kwargs["max_tokens"] == 512  # no per-response ceiling: the configured one stands
+
+
+# ── Default language for turns STT never labelled ─────────────────────────────
+
+
+def _chunk_texts(handler, **drive_kwargs):
+    """The text of each emitted chunk, which is one TTS synthesis call each."""
+    chat = Chat(10)
+    chat.add_item(make_user_message("ただいま"))
+    rc = RuntimeConfig(chat=chat, session=RealtimeSessionCreateRequest(type="realtime", instructions="話して。"))
+    req = GenerateResponseRequest(runtime_config=rc, turn_id="t", turn_revision=0, **drive_kwargs)
+    return [out.text for out in handler.process(req) if isinstance(out, LLMResponseChunk) and out.text]
+
+
+_JAPANESE_REPLY = "おかえりっ。今日ちょっと長かったね。ごはんどうする?"
+
+
+def test_a_turn_that_arrives_without_a_language_is_not_segmented():
+    """The state --text-input is in today: only STT labels a turn, so a typed one is None.
+
+    NLTK does not treat 。 as a sentence end, so the whole reply is one sentence and
+    nothing is spoken until generation finishes -- the exact failure the Japanese
+    segmenter exists to fix, still live on every path the transcriber does not touch.
+    """
+    h = _make_handler(stream=True)
+    h.client.chat.completions.create = lambda **k: _FakeStream([_chunk(content=_JAPANESE_REPLY)])
+
+    assert _chunk_texts(h, language_code=None) == [_JAPANESE_REPLY]
+
+
+def test_default_language_segments_a_turn_that_arrives_without_one():
+    h = _make_handler(stream=True, default_language="ja", stream_batch_sentences=1)
+    h.client.chat.completions.create = lambda **k: _FakeStream([_chunk(content=_JAPANESE_REPLY)])
+
+    chunks = _chunk_texts(h, language_code=None)
+
+    # The opening interjection is released on its own -- that clause is the whole of
+    # the time-to-first-audio path -- and the clauses carry no half-width space.
+    assert chunks[0] == "おかえりっ。"
+    assert "".join(chunks) == _JAPANESE_REPLY
+
+
+def test_a_labelled_turn_still_wins_over_the_default():
+    h = _make_handler(stream=True, default_language="ja", stream_batch_sentences=1)
+    h.client.chat.completions.create = lambda **k: _FakeStream([_chunk(content="Hallo. Wie geht es dir?")])
+
+    assert _chunk_texts(h, language_code="de") == ["Hallo.", "Wie geht es dir?"]
+
+
+def test_the_default_language_also_covers_the_audio_input_path():
+    """--stt none sends audio straight to the model, so every turn arrives unlabelled."""
+    h = _make_handler(stream=False, default_language="ja")
+    h.client.chat.completions.next_result = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=_JAPANESE_REPLY, refusal=None, tool_calls=[]))],
+        usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1),
+    )
+    cfg = RuntimeConfig(chat=Chat(5), session=RealtimeSessionCreateRequest(type="realtime", instructions="話して。"))
+
+    outputs = list(
+        h.process(
+            GenerateResponseRequest(
+                runtime_config=cfg,
+                audio=np.zeros(1600, dtype=np.float32),
+                audio_sample_rate=16000,
+            )
+        )
+    )
+
+    chunks = [out for out in outputs if isinstance(out, LLMResponseChunk) and out.text]
+    assert [chunk.language_code for chunk in chunks] == ["ja"]
+
+
+# ── Tool choreography is only sent to a session that has tools ────────────────
+
+
+def _system_message(handler, **drive_kwargs):
+    captured = {}
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return _FakeStream([_chunk(content="ok.")])
+
+    handler.client.chat.completions.create = create
+    _drive(handler, **drive_kwargs)
+    return captured["messages"][0]["content"]
+
+
+def test_a_session_without_tools_is_not_taught_tool_choreography():
+    """Seven lines about a capability that does not exist, printed after the persona."""
+    system = _system_message(_make_handler(stream=True))
+
+    assert "Speech is the default." not in system
+    assert "expression/background" not in system
+    assert "The session prompt sets reply length." in system
+
+
+def test_a_session_with_tools_still_gets_the_choreography():
+    tools = [{"type": "function", "name": "dance", "description": "Dance.", "parameters": {"type": "object"}}]
+    system = _system_message(_make_handler(stream=True), tools=tools)
+
+    assert "Speech is the default." in system
+
+
+def test_tool_choice_none_counts_as_no_tools():
+    tools = [{"type": "function", "name": "dance", "description": "Dance.", "parameters": {"type": "object"}}]
+    system = _system_message(_make_handler(stream=True), tools=tools, tool_choice="none")
+
+    assert "Speech is the default." not in system
+
+
+# ── Reply-shape tally ─────────────────────────────────────────────────────────
+
+
+def _replying(text):
+    def create(**_kwargs):
+        return _FakeStream([_chunk(content=text)])
+
+    return create
+
+
+def _reply_shape_lines(handler, replies, caplog):
+    lines = []
+    with caplog.at_level(logging.INFO, logger=base_mod.__name__):
+        for reply in replies:
+            caplog.clear()
+            handler.client.chat.completions.create = _replying(reply)
+            _drive(handler)
+            lines += [r.getMessage() for r in caplog.records if r.getMessage().startswith("Reply shape:")]
+    return lines
+
+
+def test_the_lead_in_tally_makes_a_collapsed_opener_visible(caplog):
+    h = _make_handler(stream=True, stream_batch_sentences=1)
+
+    lines = _reply_shape_lines(h, ["Yeah. Sure thing.", "Yeah. Of course.", "Right. Got it."], caplog)
+
+    assert len(lines) == 3
+    assert "lead-in='Yeah.'" in lines[0]
+    assert "chars=17" in lines[0]
+    # The third turn's tally is what the feature exists to show: two of three the same.
+    assert "last 3 lead-ins: Yeah. x2" in lines[2]
+
+
+def test_the_tally_does_not_carry_across_sessions(caplog):
+    h = _make_handler(stream=True, stream_batch_sentences=1)
+
+    _reply_shape_lines(h, ["Yeah. Sure thing."], caplog)
+    h.on_session_end()
+    lines = _reply_shape_lines(h, ["Yeah. Of course."], caplog)
+
+    assert "last 1 lead-ins: Yeah. x1" in lines[0]
+
+
+def test_an_out_of_band_response_is_not_tallied(caplog):
+    h = _make_handler(stream=True, stream_batch_sentences=1)
+    h.client.chat.completions.create = lambda **k: _FakeStream([_chunk(content="Background note.")])
+
+    with caplog.at_level(logging.INFO, logger=base_mod.__name__):
+        _drive(h, response=RealtimeResponseCreateParams(conversation="none", output_modalities=["text"]))
+
+    assert not [r for r in caplog.records if r.getMessage().startswith("Reply shape:")]
 
 
 # ── Standalone runner (no pytest required) ────────────────────────────────────

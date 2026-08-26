@@ -7,6 +7,7 @@ Runtime-supported values in `s2s_pipeline.py`:
 - `transformers` → `language_model.py` (Transformers backend)
 - `mlx-lm` → `language_model.py` (MLX backend)
 - `responses-api` → `responses_api_language_model.py`
+- `chat-completions` → `chat_completions_language_model.py`
 
 ## Usage
 
@@ -73,6 +74,51 @@ Common options:
 - `--chat_size`
 - `--init_chat_prompt`
 - `--user_role`
+
+### 4) OpenAI-compatible Chat Completions (`--llm_backend chat-completions`)
+
+- Handler: `ChatCompletionsApiModelHandler`
+- Typical use: a local llama.cpp / vLLM server, or any provider that speaks Chat
+  Completions rather than the Responses API
+- Backend-specific args prefix: `--responses_api_*` — the connection flags are shared
+  with the Responses backend so one set of env vars drives both
+
+```bash
+speech-to-speech serve \
+  --llm_backend chat-completions \
+  --model_name "unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M" \
+  --responses_api_base_url http://127.0.0.1:8080/v1 \
+  --responses_api_gen_temperature 0.9
+```
+
+Common options:
+- `--chat_size`
+- `--init_chat_prompt`
+- `--responses_api_default_language` — the language to assume for a turn that arrives
+  without one. Only a transcription labels a turn's language; the session carries it
+  forward to typed turns and tool follow-ups, but a session that is only ever typed to
+  has nothing to inherit for its first turn. Which language a turn is in selects its
+  sentence tokenizer, and the wrong one does not split Japanese at 。 — so the whole
+  reply reaches the TTS as one sentence and nothing is spoken until generation ends.
+
+Sampling (Chat Completions only). Every one is unset by default, which omits the key
+from the request and leaves the server's own value in force:
+- `--responses_api_gen_temperature`
+- `--responses_api_gen_top_p`
+- `--responses_api_gen_frequency_penalty`
+- `--responses_api_gen_presence_penalty`
+- `--responses_api_gen_max_tokens`
+- `--responses_api_gen_seed`
+
+These are sent with every generation request, but not with warmup or with history
+compaction, which run outside the per-turn kwargs. They are declared on this backend
+rather than shared with `responses-api` because that protocol spells `max_tokens` as
+`max_output_tokens` and has no penalty parameters at all.
+
+On the audio-input path (`--stt none`), an explicitly configured
+`--responses_api_gen_temperature` takes precedence over
+`--responses_api_audio_temperature`'s default, and a client's per-response
+`max_output_tokens` takes precedence over both.
 
 ## LLM Behavior
 

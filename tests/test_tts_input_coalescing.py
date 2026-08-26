@@ -31,6 +31,25 @@ def test_coalesce_pending_tts_input_merges_ready_sentences_and_stops_before_resp
     assert isinstance(remaining, EndOfResponse)
 
 
+def test_coalesce_pending_tts_input_joins_japanese_clauses_without_a_space():
+    """The LM stage stopped putting spaces between Japanese clauses; this path put them back.
+
+    A half-width space between two Japanese clauses is a character the TTS reads aloud,
+    which is why the language model joins its own batch with an empty separator. That
+    fix does not survive the queue: with --stream_batch_sentences 1 each clause arrives
+    as its own input, and this method re-joins whatever is still pending.
+    """
+    handler = _make_handler()
+
+    handler.queue_in.put(TTSInput(text="声でわかるよ、それ。", language_code="ja"))
+    handler.queue_in.put(TTSInput(text="とりあえず座りなよ。", language_code="ja"))
+
+    text, lang = handler._coalesce_pending_tts_input(TTSInput(text="おつかれー。", language_code="ja"))
+
+    assert text == "おつかれー。声でわかるよ、それ。とりあえず座りなよ。"
+    assert lang == "ja"
+
+
 def test_coalesce_pending_processor_output_for_one_response():
     processor = LMOutputProcessor.__new__(LMOutputProcessor)
     processor.setup()

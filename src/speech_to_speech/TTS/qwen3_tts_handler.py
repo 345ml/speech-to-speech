@@ -43,6 +43,7 @@ from speech_to_speech.pipeline.messages import (
 )
 from speech_to_speech.pipeline.speculative_turns import SpeculativeTurnTracker
 from speech_to_speech.utils.mlx_lock import MLXLockContext
+from speech_to_speech.utils.text_language import sentence_join_separator
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -836,7 +837,13 @@ class Qwen3TTSHandler(BaseHandler[TTSIn, TTSOut]):
         for event in text_events:
             self.queue_out.put(cast(TTSOut, event))
 
-        combined_text = " ".join(parts).strip()
+        # Same join as the LM stage does over its own batch
+        # (base_openai_compatible_language_model.py), and it has to reach the same
+        # answer: a half-width space between two Japanese clauses is a character the
+        # TTS reads out loud. This path is how the spaces came back -- the LM joins a
+        # batch correctly, the queue splits it into separate inputs again, and this
+        # re-joins whatever is still pending for the same response.
+        combined_text = sentence_join_separator(language_code).join(parts).strip()
         return combined_text, language_code
 
     def process(self, tts_input: TTSIn) -> Iterator[TTSOut]:

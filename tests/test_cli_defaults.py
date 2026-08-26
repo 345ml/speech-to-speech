@@ -47,6 +47,7 @@ def test_release_defaults_match_responses_api_parakeet_qwen3_profile():
     assert responses_api_args.responses_api_reasoning_effort == "none"
     assert responses_api_args.responses_api_audio_content_type == "input_audio"
     assert responses_api_args.responses_api_audio_history_turns == 1
+    assert responses_api_args.responses_api_default_language is None
     assert qwen3_args.qwen3_tts_model_name == "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
     assert qwen3_args.qwen3_tts_speaker == "Aiden"
     assert qwen3_args.qwen3_tts_language == "auto"
@@ -537,3 +538,47 @@ def test_talk_fails_fast_when_prompt_toolkit_is_missing(monkeypatch):
 def test_talk_without_text_input_does_not_need_prompt_toolkit(monkeypatch):
     monkeypatch.setitem(sys.modules, "prompt_toolkit", None)
     assert parse_talk_arguments([]).text_input is False
+
+
+def test_sampling_flags_default_to_unset_so_the_server_keeps_its_own_values():
+    """Every gen_ flag defaults to None, which drops the key from the request.
+
+    Baking in a value here would silently override a llama-server started with its own
+    --temp, which is exactly what nobody asked for by not passing the flag.
+    """
+    args = ChatCompletionsLanguageModelHandlerArguments()
+
+    assert args.responses_api_gen_temperature is None
+    assert args.responses_api_gen_top_p is None
+    assert args.responses_api_gen_frequency_penalty is None
+    assert args.responses_api_gen_presence_penalty is None
+    assert args.responses_api_gen_max_tokens is None
+    assert args.responses_api_gen_seed is None
+
+
+def test_chat_completions_accepts_sampling_flags_through_the_parser():
+    parsed = parse_arguments(
+        [
+            "--llm_backend",
+            "chat-completions",
+            "--responses_api_gen_temperature",
+            "1.05",
+            "--responses_api_gen_seed",
+            "7",
+            "--responses_api_default_language",
+            "ja",
+        ]
+    )
+
+    config = parsed.llm_backend.config
+    assert config["gen_kwargs"]["temperature"] == 1.05
+    assert config["gen_kwargs"]["seed"] == 7
+    assert config["gen_kwargs"]["top_p"] is None
+    assert config["default_language"] == "ja"
+
+
+def test_responses_api_backend_carries_no_sampling():
+    """The gen_ flags live on the Chat Completions child, so this backend has none."""
+    parsed = parse_arguments(["--llm_backend", "responses-api"])
+
+    assert parsed.llm_backend.config["gen_kwargs"] == {}

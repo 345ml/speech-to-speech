@@ -233,6 +233,12 @@ class ConnState(BaseModel):
     speculative_user_turn_revision: Optional[int] = None
     speculative_user_speech_stopped_at_s: Optional[float] = None
     speculative_user_item_id: Optional[str] = None
+    # The language the transcriber reported for the most recent user turn. Only a
+    # transcription event carries one, so a tool follow-up and a `response.create`
+    # (which is how a typed turn arrives) would otherwise generate with no language at
+    # all -- and no language selects the tokenizer that cannot split Japanese. Held on
+    # the session so those requests can inherit it from the turn they follow.
+    speculative_user_language_code: Optional[str] = None
     speculative_audio_duration_s: float = 0.0
     # Client conversation.item.create items that arrived while a response was
     # generating. Applying them mid-generation races the LLM handler's chat
@@ -652,6 +658,7 @@ class RealtimeService:
             st.speculative_user_turn_id = event.turn_id
             st.speculative_user_turn_revision = event.turn_revision
             st.speculative_user_speech_stopped_at_s = event.speech_stopped_at_s
+            st.speculative_user_language_code = event.language_code
 
         queue = self.text_prompt_queue
         if queue and transcript:

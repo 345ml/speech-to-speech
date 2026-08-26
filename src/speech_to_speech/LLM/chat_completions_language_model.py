@@ -342,7 +342,14 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
         return self._chat_messages(active_chat, audio_content_type=self.audio_content_type)
 
     def _build_optional_kwargs(self, req_tools: Any, req_tool_choice: Any) -> dict[str, Any]:
-        return _build_chat_optional_kwargs(req_tools, req_tool_choice)
+        # Sampling first, tools second: tools/tool_choice are protocol rather than
+        # preference, and a same-named sampling key must not shadow them. Sampling goes
+        # in as named create() kwargs, not extra_body, because the SDK types every one
+        # of these -- and because extra_body is built once in setup() and would then
+        # also reach warmup and the history compactor.
+        optional_kwargs = self._sampling_kwargs()
+        optional_kwargs.update(_build_chat_optional_kwargs(req_tools, req_tool_choice))
+        return optional_kwargs
 
     def _request(self, api_input: list[dict[str, Any]], optional_kwargs: dict[str, Any]) -> Any:
         return _request_chat_completions(
@@ -366,4 +373,5 @@ class ChatCompletionsApiModelHandler(BaseOpenAICompatibleHandler):
         yield from _tool_calls_from_accum(tool_accum)
 
     def on_session_end(self) -> None:
+        super().on_session_end()
         logger.debug("Chat Completions API language model session state reset")
