@@ -60,7 +60,9 @@ args=(
   --language ja
   --llm_backend chat-completions
   --responses_api_base_url "http://${LLM_HOST:-127.0.0.1}:${LLM_PORT:-8080}/v1"
-  --model_name "${LLM_MODEL_NAME:-unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M}"
+  # Inert against llama-server: it serves whatever it loaded and the pipeline never
+  # logs this. Kept matching serve_llm.sh so the two files do not disagree.
+  --model_name "${LLM_MODEL_NAME:-mmnga-o/llm-jp-4-8b-instruct-gguf:Q4_K_M}"
   --init_chat_prompt "$(cat "$PROMPT_FILE")"
   # Only a transcription labels a turn's language. The session carries it forward to
   # typed turns and tool follow-ups, but the first turn of a typed-only session has

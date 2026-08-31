@@ -8,7 +8,7 @@
 #   speech-to-speech local \
 #     --llm_backend chat-completions \
 #     --responses_api_base_url http://127.0.0.1:8080/v1 \
-#     --model_name unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M
+#     --model_name mmnga-o/llm-jp-4-8b-instruct-gguf:Q4_K_M
 #
 # Wait for the server to report it is listening before starting the pipeline. The
 # ChatCompletions handler warms up during setup, so a pipeline started too early dies
@@ -17,11 +17,44 @@
 # Model load and Metal shader compilation (~10s on first use) happen once here, so
 # neither cost lands inside a turn, and the server outlives pipeline restarts.
 #
-# WHY THIS MODEL. Qwen3-4B-Instruct-2507 is non-thinking by construction: unlike the
-# hybrid Qwen3 models it cannot emit a <think> block, which would put hundreds of
-# tokens ahead of the first speakable character. Q4_K_M keeps the weights near 2.3GB,
-# which is what matters on a 16GB Mac where the MLX STT and TTS models are resident in
-# the same unified memory.
+# WHY THIS MODEL. llm-jp-4-8b-instruct is the instruct (SFT-only) member of the llm-jp-4
+# family, trained from scratch on 11.7T tokens by NII's LLM research centre, Apache 2.0.
+# The other members -- llm-jp-4-8b-thinking, -32b-a3b-thinking, -33b-thinking -- all
+# reason before answering, which puts hundreds of tokens ahead of the first speakable
+# character. This one does not: it is the only llm-jp release that is both non-thinking
+# and small enough to sit beside the MLX STT and TTS models in 16GB of unified memory.
+#
+# It replaced Qwen3-4B-Instruct-2507 on the strength of how it talks, not a benchmark.
+# No MT-Bench-ja figure is published for the instruct variant; the 0.706 on the Swallow
+# leaderboard belongs to llm-jp-4-8b-thinking and was earned with the thinking tokens
+# this pipeline cannot afford. The comparison that decided it was a greedy A/B against
+# the 4B on prompts/companion_ja.txt.
+#
+# What it costs. Q4_K_M is 5.30GB and ~21 tok/s here, against 2.3GB and ~34 for the 4B
+# it replaced. Prefill is ~210 tok/s. Q5_K_M (6.15GB) is the last quant with any room
+# left; Q6_K (7.05GB) and Q8_0 (9.13GB) do not fit beside the MLX models on a 16GB Mac,
+# where the Metal working set defaults to about 10.6GB. Q8_0 will load on its own, which
+# is enough to A/B the text against Q4_K_M without the pipeline.
+#
+# Its tokenizer is the reason 4096 of context still goes as far as it did at 4B. The
+# few-shot block in prompts/companion_ja.txt measures 263 tokens here against the
+# 350-450 it cost under Qwen's vocabulary, and the whole persona file is 558.
+#
+# Two quirks, both measured, neither fatal:
+#   - Every reply arrives with a leading half-width space. The Japanese segmenter keeps
+#     it on the first clause, which is the one that reaches the TTS first. It is audible
+#     as nothing so far, and Reply-shape logging strips it, so it is recorded rather
+#     than fixed. If a leading pause ever shows up in the audio, this is where it is.
+#   - Longer replies come back as Markdown hard breaks ("...。  \n"). remove_markdown
+#     leaves them and remove_unspeechable keeps whitespace, but JapaneseClauseTokenizer
+#     drops them: the clauses it emits carry no newline and no trailing space.
+#
+# Its chat template is documented as OpenAI Harmony-compatible, which raised the worry
+# that channel markers (<|channel|>final) would be spoken -- SPEECHABLE_PATTERN does not
+# strip angle brackets. Probed: content comes back clean. The template also ignores
+# chat_template_kwargs.enable_thinking, which the pipeline sends unconditionally to a
+# non-OpenAI base URL; a request with and without it returns byte-identical text, so
+# --responses_api_disable_thinking needs no change.
 #
 # Weights come from the shared HF cache (~/.cache/huggingface/hub) via -hf, which is
 # also where the MLX models live. Override without editing this file:
@@ -29,32 +62,28 @@
 #   LLM_MODEL=/path/to/model.gguf  ./scripts/serve_llm.sh   # a loose local file
 #   LLM_PORT=8081                  ./scripts/serve_llm.sh
 #
-# QWEN3.5. The 9B weights are already in that cache, and switching to them is env-only:
-# uncomment the two lines below, or leave the file alone and run
-#   LLAMA_ARG_MMPROJ_AUTO=0 LLM_HF=unsloth/Qwen3.5-9B-GGUF:Q4_K_M ./scripts/serve_llm.sh
-# Nothing on the pipeline side changes. --model_name is only a label: llama-server
-# serves the model it loaded and echoes back its own name, so the two need not match.
+# Nothing on the pipeline side changes when you swap models. --model_name is only a
+# label: llama-server serves the model it loaded and echoes back its own name, and the
+# pipeline never logs the value, so the two need not match.
 #
-# What it costs. Measured here at Q4_K_M: the 4B is 2.3GB and ~34 tok/s, the 9B 5.3GB
-# and ~17. On a 16GB Mac that is 3GB more taken from the same unified memory the MLX
-# STT and TTS models sit in, for half the generation speed.
+# ALTERNATIVES, all already in that cache and all env-only:
+#   LLM_HF=unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M
+#       The previous default. 2.3GB and ~34 tok/s -- the one to go back to when the
+#       machine is under memory pressure or TTFA matters more than the wording.
+#   LLAMA_ARG_MMPROJ_AUTO=0 LLM_HF=unsloth/Qwen3.5-9B-GGUF:Q4_K_M
+#       5.3GB and ~17 tok/s. Two catches. It is a hybrid that spends the reply inside
+#       <think> unless chat_template_kwargs.enable_thinking=false reaches it -- a
+#       120-token probe came back with content empty -- which is what the pipeline's
+#       responses_api_disable_thinking and --jinja below are for together. And its
+#       linear-attention layers make --cache-reuse inert ("cache_reuse is not supported
+#       by this context" at startup), so every turn that drops an exchange re-prefills
+#       from the system prompt. MMPROJ_AUTO=0 because the unsloth repo ships a vision
+#       projector that -hf would otherwise download and load for nothing.
+#   LLM_HF=mmnga/ELYZA-Shortcut-1.0-Qwen-7B-gguf:Q4_K_M
+#   LLM_HF=elyza/Llama-3-ELYZA-JP-8B-GGUF:Q4_K_M
+#       Japanese continued-pretraining of Qwen2.5-7B and Llama-3-8B. Both non-thinking.
 #
-# MMPROJ_AUTO=0 because the unsloth repo ships a vision projector and -hf downloads and
-# loads it by default. This pipeline never sends an image, so that is memory and load
-# time spent on nothing.
-#
-# Thinking. Qwen3.5 is a hybrid, unlike Qwen3-4B-Instruct-2507: left alone it spends the
-# reply inside <think>, and a 120-token probe came back with the content field empty --
-# nothing speakable at all. It stays quiet only because the pipeline sends
-# chat_template_kwargs.enable_thinking=false (responses_api_disable_thinking, on by
-# default for a non-OpenAI base URL) and --jinja below is what makes llama-server honour
-# it. Dropping either one brings the <think> block back.
-#
-# --cache-reuse is inert with this model whatever its value: llama-server logs
-# "cache_reuse is not supported by this context" at startup and disables it, because
-# Qwen3.5 interleaves linear-attention layers whose state cannot be recovered by shifting
-# KV. Every turn that drops an exchange re-prefills from the system prompt. The 4B has no
-# such warning, so the tuning below is tuning for the 4B.
+# llm-jp-4 logs no cache_reuse warning, so the tuning below is live for the default.
 #
 # FLAGS
 # --parallel 1   one slot holds the whole KV prefix, so --cache-reuse actually hits.
@@ -76,7 +105,7 @@ if ! command -v llama-server >/dev/null 2>&1; then
   exit 1
 fi
 
-# QWEN3.5-9B: uncomment both lines to switch (see QWEN3.5 above). An LLM_HF or
+# QWEN3.5-9B: uncomment both lines to switch (see ALTERNATIVES above). An LLM_HF or
 # LLAMA_ARG_MMPROJ_AUTO already set in the environment still wins.
 # : "${LLM_HF:=unsloth/Qwen3.5-9B-GGUF:Q4_K_M}"
 # export LLAMA_ARG_MMPROJ_AUTO=0
@@ -84,7 +113,7 @@ fi
 if [ -n "${LLM_MODEL:-}" ]; then
   model_args=(-m "$LLM_MODEL")
 else
-  model_args=(-hf "${LLM_HF:-unsloth/Qwen3-4B-Instruct-2507-GGUF:Q4_K_M}")
+  model_args=(-hf "${LLM_HF:-mmnga-o/llm-jp-4-8b-instruct-gguf:Q4_K_M}")
 fi
 
 exec llama-server "${model_args[@]}" \
