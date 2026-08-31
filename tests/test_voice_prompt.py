@@ -62,6 +62,36 @@ def test_voice_prompt_is_short_and_keeps_persona_in_session_prompt():
     assert "Match the user's intent" not in prompt
 
 
+def test_voice_prompt_defers_reply_length_to_the_session_prompt():
+    """The tail is last, and last wins ties -- so the only safe thing to assert there is
+    which text decides. Hardcoding a length here overrode every persona that set one."""
+    prompt = build_voice_system_prompt("Be concise.")
+
+    assert "The session prompt sets reply length." in prompt
+    assert "usually one spoken sentence, two if needed" not in prompt
+
+
+def test_voice_prompt_omits_tool_choreography_when_the_session_has_no_tools():
+    """Seven lines about a capability that does not exist, printed after the persona."""
+    with_tools = build_voice_system_prompt("Be concise.")
+    without = build_voice_system_prompt("Be concise.", has_tools=False)
+
+    assert "Speech is the default." not in without
+    assert "expression/background" not in without
+    assert "Never mention tools" not in without
+    # The channel rules that are true whatever is configured survive.
+    assert "The session prompt sets reply length." in without
+    assert "Treat transcripts as noisy." in without
+    assert len(without.split()) < len(with_tools.split()) / 2
+
+
+def test_voice_prompt_keeps_tool_rules_when_a_local_tool_block_is_supplied():
+    """The local backend passes a tool block instead of has_tools; it means the same."""
+    prompt = build_voice_system_prompt("Be concise.", tool_section="## Tools\ndance()", has_tools=False)
+
+    assert "Speech is the default." in prompt
+
+
 def test_voice_prompt_makes_speech_the_default_and_handles_noisy_stt():
     prompt = build_voice_system_prompt("Be concise.")
 

@@ -8,6 +8,13 @@ import requests  # type: ignore[import-untyped]
 from nltk import sent_tokenize
 from PIL import Image
 
+from speech_to_speech.utils.text_language import is_japanese_language
+
+# Re-exported (hence the redundant alias): `sentence_join_separator` moved to
+# `utils.text_language` when the TTS stage needed it too, and stays importable here
+# for the callers that already knew this address.
+from speech_to_speech.utils.text_language import sentence_join_separator as sentence_join_separator
+
 SMART_PUNCT_TRANSLATION = str.maketrans(
     {
         "\u2018": "'",
@@ -287,34 +294,6 @@ def image_url_to_pil(image_url: str) -> Image.Image:
     resp = requests.get(image_url, timeout=10)
     resp.raise_for_status()
     return Image.open(io.BytesIO(resp.content))
-
-
-# Whisper reports "ja"; some callers pass an ISO 639-2 code or a region tag.
-# `STT/hallucinations.py` deliberately keeps its own copy: the STT stage must not
-# depend on the LLM package for a language predicate.
-_JAPANESE_LANGUAGE_CODES = frozenset({"ja", "jpn"})
-
-
-def is_japanese_language(language_code: Optional[str]) -> bool:
-    """True when this turn's language needs the Japanese-specific text handling.
-
-    Japanese differs from the other languages in two places that must agree -- which
-    sentence tokenizer runs, and which separator joins a batch of clauses -- so both
-    ask this one question.
-    """
-    if not language_code:
-        return False
-    return language_code.strip().lower().replace("_", "-").split("-")[0] in _JAPANESE_LANGUAGE_CODES
-
-
-def sentence_join_separator(language_code: Optional[str]) -> str:
-    """The string that joins a batch of sentences before it is spoken.
-
-    Japanese does not separate clauses with spaces. A half-width space between them is
-    a character the TTS reads, so it gets an empty separator; every other language keeps
-    the single space it has always had.
-    """
-    return "" if is_japanese_language(language_code) else " "
 
 
 def make_sentence_tokenizer(language_code: Optional[str]) -> Callable[[str], list[str]]:

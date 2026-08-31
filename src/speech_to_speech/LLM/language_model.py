@@ -284,19 +284,25 @@ class BaseLanguageModelHandler(BaseHandler[LLMIn, LLMOut], ABC):
 
         function_tools = [FunctionTool(**t.model_dump()) for t in raw_tools if t.type == "function"]
 
-        build_system_prompt = build_voice_system_prompt if wants_audio else build_text_system_prompt
+        has_tools = bool(function_tools) and tool_choice != "none"
 
-        if function_tools and tool_choice != "none":
+        if has_tools:
             tool_section = build_tool_system_prompt(function_tools, text_only=not wants_audio)
-            full_instructions = build_system_prompt(instructions, tool_section=tool_section)
             block_regex = build_block_regex()
             enter_code = ENTER_CODE
             end_code = END_CODE
         else:
-            full_instructions = build_system_prompt(instructions)
+            tool_section = ""
             block_regex = None
             enter_code = None
             end_code = None
+
+        # Only the voice rules are split by tool presence; the text tail's tool lines
+        # are short enough not to be worth the same treatment.
+        if wants_audio:
+            full_instructions = build_voice_system_prompt(instructions, tool_section=tool_section, has_tools=has_tools)
+        else:
+            full_instructions = build_text_system_prompt(instructions, tool_section=tool_section)
 
         chat.add_item(make_system_message(full_instructions))
 

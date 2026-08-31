@@ -11,8 +11,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-# Whisper reports "ja"; some callers pass ISO 639-2 or a region tag.
-_JAPANESE_LANGUAGE_CODES = frozenset({"ja", "jpn"})
+from speech_to_speech.utils.text_language import is_japanese_language
 
 _HALLUCINATIONS = frozenset(
     {
@@ -47,9 +46,7 @@ def is_meaningful_transcription(text: str, language_code: Optional[str]) -> bool
     the two needs utterance length and VAD confidence, neither of which reaches this
     stage yet, so the phrase is left through on purpose.
     """
-    if not language_code:
-        return True
-    if language_code.strip().lower().replace("_", "-").split("-")[0] not in _JAPANESE_LANGUAGE_CODES:
+    if not is_japanese_language(language_code):
         return True
 
     stripped = text.strip()

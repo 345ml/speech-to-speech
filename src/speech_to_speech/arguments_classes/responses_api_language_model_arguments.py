@@ -51,6 +51,15 @@ class ResponsesApiLanguageModelHandlerArguments(LanguageModelBaseArguments):
         default=0.0,
         metadata={"help": "Chat completion temperature for audio-input LLM requests. Default is 0.0."},
     )
+    responses_api_default_language: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Language code for a turn that arrives without one. Only STT labels a turn's language, so a "
+            "typed turn (--text-input) and a tool follow-up arrive with none, and then neither the Japanese "
+            "clause segmenter nor its empty clause separator runs. Set it to the language actually spoken "
+            "(e.g. 'ja') so typed and spoken turns are segmented identically. Default is None."
+        },
+    )
     responses_api_audio_content_type: Literal["input_audio", "audio_url"] = field(
         default="input_audio",
         metadata={

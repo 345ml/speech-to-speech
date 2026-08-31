@@ -116,11 +116,10 @@ class ResponsesApiModelHandler(BaseOpenAICompatibleHandler):
         req_tools: Any,
         req_tool_choice: Any,
     ) -> dict[str, Any]:
-        kwargs = _build_chat_optional_kwargs(req_tools, req_tool_choice)
-        max_tokens = getattr(response, "max_output_tokens", None) if response is not None else None
-        kwargs.setdefault("max_tokens", max_tokens or self.audio_max_tokens)
-        kwargs.setdefault("temperature", self.audio_temperature)
-        return kwargs
+        # This backend's audio turns go out over Chat Completions (see _request_audio),
+        # so they take that protocol's tool shape rather than this class's own
+        # Responses-shaped kwargs. The token budget is the base's rule either way.
+        return self._apply_audio_budget(_build_chat_optional_kwargs(req_tools, req_tool_choice), response)
 
     def _serialize_audio(self, active_chat: Chat) -> list[dict[str, Any]]:
         return _chat_messages(active_chat, audio_content_type=self.audio_content_type)
@@ -152,6 +151,11 @@ class ResponsesApiModelHandler(BaseOpenAICompatibleHandler):
         return active_chat.to_responses_api_chat()
 
     def _build_optional_kwargs(self, req_tools: Any, req_tool_choice: Any) -> dict[str, Any]:
+        # No _sampling_kwargs() here, and that is not an omission: the `gen_` flags are
+        # declared on the Chat Completions arguments only, because this protocol spells
+        # max_tokens as max_output_tokens and has no penalty parameters at all. Moving
+        # them to the shared parent means teaching this method that rename and that
+        # omission first.
         optional_kwargs = self._reasoning_kwargs()
         if req_tools is not None:
             optional_kwargs["tools"] = req_tools
@@ -211,4 +215,5 @@ class ResponsesApiModelHandler(BaseOpenAICompatibleHandler):
                 logger.warning(f"Not supported message type: {message.type}")
 
     def on_session_end(self) -> None:
+        super().on_session_end()
         logger.debug("OpenAI API language model session state reset")

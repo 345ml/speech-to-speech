@@ -1802,6 +1802,44 @@ class TestHandleResponseCreate:
         assert followup_req.turn_revision == 2
         assert followup_req.speech_stopped_at_s == 123.0
 
+    def test_response_create_inherits_the_last_transcribed_turns_language(self, service, conn_id, text_prompt_queue):
+        """`response.create` carries no language, and a typed turn arrives only that way.
+
+        Without this the reply is generated with no language at all, which picks the
+        sentence tokenizer that cannot split Japanese -- so nothing is spoken until
+        generation finishes.
+        """
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="こんばんは", language_code="ja", turn_id="turn_1"),
+        )
+        initial_req = text_prompt_queue.get()
+        assert initial_req.language_code == "ja"
+        service.response._ensure_response(conn_id, initial_req.response_key)
+        service.response._end_response(conn_id)
+
+        service.handle_response_create(conn_id, ResponseCreateEvent(type="response.create"))
+
+        assert text_prompt_queue.get().language_code == "ja"
+
+    def test_an_out_of_band_response_inherits_no_turn_state_including_language(
+        self, service, conn_id, text_prompt_queue
+    ):
+        service.dispatch_pipeline_event(
+            conn_id,
+            TranscriptionCompletedEvent(transcript="こんばんは", language_code="ja", turn_id="turn_1"),
+        )
+        initial_req = text_prompt_queue.get()
+        service.response._ensure_response(conn_id, initial_req.response_key)
+        service.response._end_response(conn_id)
+
+        service.handle_response_create(
+            conn_id,
+            ResponseCreateEvent(type="response.create", response={"conversation": "none"}),
+        )
+
+        assert text_prompt_queue.get().language_code is None
+
     def test_response_create_rejects_complex_tool_choice(self, service, conn_id, runtime_config):
         evt = ResponseCreateEvent(
             type="response.create",
