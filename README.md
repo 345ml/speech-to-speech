@@ -143,6 +143,7 @@ pip install "speech-to-speech[faster-whisper]"  # Faster Whisper STT
 pip install "speech-to-speech[whisper-mlx]"     # Lightning Whisper MLX STT on macOS
 pip install "speech-to-speech[paraformer]"      # Paraformer STT through FunASR
 pip install "speech-to-speech[mlx-lm]"          # mlx-vlm support for vision models on macOS
+pip install "speech-to-speech[macos-aec]"       # macOS echo cancellation for the packaged client
 ```
 
 Deprecated implementations, including MeloTTS, live in [`archive/`](./archive) and are no longer wired into the CLI.
@@ -211,6 +212,39 @@ line interrupts whatever the assistant is currently saying, the same way speakin
 spoken as usual. Because the prompt puts the terminal in raw mode, `Ctrl-C` and `Ctrl-D` at the prompt end the
 session. The flag needs a real terminal; when stdin or stdout is piped it logs a warning and continues with voice
 input only.
+
+### Keeping the speaker out of the microphone
+
+When you use the built-in speakers instead of a headset, the assistant hears itself: its own voice reaches the
+microphone, gets transcribed, and can trigger a reply to itself. Two flags address this, and they trade off
+against each other.
+
+`--echo-cancellation os` routes capture and playback through the macOS voice-processing unit, which subtracts the
+audio it is rendering from the audio it captures. Barge-in keeps working, because your own voice is still heard:
+
+```bash
+pip install "speech-to-speech[macos-aec]"
+speech-to-speech local --echo-cancellation os
+```
+
+It is macOS-only and needs the `macos-aec` extra. When the platform is wrong, the extra is missing, or the
+device refuses the voice-processing unit, it logs a warning and continues without cancellation, so the flag is
+safe to leave in a shared command line.
+
+Three costs are worth knowing about. The unit hands over capture buffers about 100 ms at a time against the
+default path's 64 ms, and resampling to and from the rate it picks adds a few more, so reckon on roughly 40 ms of
+extra input latency. It applies its own noise suppression, which usually helps recognition but does change what
+the recognizer hears. And it binds to the system default input and output: `--input-device` and `--output-device`
+are ignored under `os` mode, with a warning, because AVAudioEngine has no equivalent of a PortAudio device
+index. Choose the devices in System Settings instead.
+
+`--block-mic-during-playback` is the portable alternative: it simply drops microphone input while audio is
+playing. Nothing can leak through because nothing is listened to, but for the same reason you cannot interrupt
+the assistant while it is speaking.
+
+On Linux, the same cancellation is available without either flag by selecting an echo-cancelled capture device.
+PulseAudio and PipeWire both publish one via `module-echo-cancel`; pass its index to `--input-device` on `talk`,
+or `--local_audio_input_device` on `local`.
 
 ### Migrating from `--mode`
 

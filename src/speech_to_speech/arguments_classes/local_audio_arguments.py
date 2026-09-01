@@ -1,5 +1,5 @@
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Literal, Optional
 
 
 @dataclass
@@ -27,6 +27,17 @@ class LocalAudioArguments:
         default=False,
         metadata={
             "help": "Pause local microphone capture while audio is playing. Disabled by default so barge-in works."
+        },
+    )
+    local_audio_echo_cancellation: Literal["off", "os"] = field(
+        default="off",
+        metadata={
+            "help": (
+                "Keep the speaker out of the microphone. 'os' routes both directions through the "
+                "macOS voice-processing unit, which cancels the assistant's own voice while leaving "
+                "barge-in working; it needs the macos-aec extra and falls back to 'off' elsewhere."
+            ),
+            "aliases": ["--echo-cancellation"],
         },
     )
     local_audio_print_json: bool = field(
