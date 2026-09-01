@@ -28,6 +28,7 @@ from jsonschema import SchemaError, ValidationError
 from jsonschema.validators import validator_for
 from openai import AsyncOpenAI
 
+from .audio_io import AudioSession, AudioStreamRequest, create_audio_io, open_audio_session
 from .console import ConsoleSink, StdoutConsole
 from .text_input import (
     TextInputCoordinator,
@@ -73,6 +74,7 @@ class RealtimeAudioClientConfig:
     print_json: bool = False
     text_input: bool = False
     block_mic_during_playback: bool = False
+    echo_cancellation: str = "off"
     thinking_sound: bool = True
     thinking_sound_file: Optional[str] = None
     thinking_sound_gain: float = THINKING_SOUND_DEFAULT_GAIN
@@ -247,12 +249,23 @@ class PlaybackBuffer:
         self._thinking_on = False
         self._thinking_delay_left = 0
         self._thinking_fade_left = 0
+        #: Optional hook fired after a clear, for backends that queue audio on the
+        #: device and would otherwise keep playing it through a barge-in.
+        self.on_clear: Callable[[], None] | None = None
 
     def clear(self) -> None:
         with self._lock:
             self._active_until = 0.0
             self._audio.clear()
             self._silence_thinking()
+        listener = self.on_clear
+        if listener is None:
+            return
+        try:
+            # Deliberately outside the lock: the listener talks to the audio device.
+            listener()
+        except Exception:
+            logger.exception("Failed to discard device-queued playback audio")
 
     def append(self, audio: bytes) -> None:
         with self._lock:
@@ -908,7 +921,7 @@ async def _run_audio_session(
     config: RealtimeAudioClientConfig,
     stop_event: Event,
 ) -> None:
-    import sounddevice as sd
+    audio_io = create_audio_io(config.echo_cancellation)
 
     mic_queue: Queue[bytes] = Queue(maxsize=128)
     playback = PlaybackBuffer(
@@ -928,18 +941,11 @@ async def _run_audio_session(
             stop_event=stop_event,
         )
 
-    def callback_recv(outdata: Any, _frames: int, _time_info: Any, status: Any) -> None:
-        if status:
-            logger.warning("Speaker status: %s", status)
-        playback.write(outdata)
-
-    def callback_send(indata: Any, _frames: int, _time_info: Any, status: Any) -> None:
-        if status:
-            logger.warning("Microphone status: %s", status)
+    def on_capture(chunk: bytes) -> None:
         if config.block_mic_during_playback and playback.is_active():
             return
         try:
-            mic_queue.put_nowait(bytes(indata))
+            mic_queue.put_nowait(chunk)
         except Full:
             logger.debug("Dropping local microphone chunk because the send queue is full")
 
@@ -967,33 +973,26 @@ async def _run_audio_session(
                 print_json=config.print_json,
             )
 
-    opened_streams: list[Any] = []
-    started_streams: list[Any] = []
+    audio_session: AudioSession | None = None
     try:
         if text_terminal is not None:
             text_terminal.activate()
-        input_stream = sd.RawInputStream(
-            samplerate=config.send_rate,
-            channels=1,
-            dtype="int16",
-            blocksize=config.chunk_size,
-            callback=callback_send,
-            device=config.input_device,
+        audio_session = open_audio_session(
+            audio_io,
+            AudioStreamRequest(
+                send_rate=config.send_rate,
+                recv_rate=config.recv_rate,
+                chunk_size=config.chunk_size,
+                input_device=config.input_device,
+                output_device=config.output_device,
+            ),
+            on_capture=on_capture,
+            fill_playback=playback.write,
+            mode=config.echo_cancellation,
         )
-        opened_streams.append(input_stream)
-        output_stream = sd.RawOutputStream(
-            samplerate=config.recv_rate,
-            channels=1,
-            dtype="int16",
-            blocksize=config.chunk_size,
-            callback=callback_recv,
-            device=config.output_device,
-        )
-        opened_streams.append(output_stream)
-
-        for stream in opened_streams:
-            stream.start()
-            started_streams.append(stream)
+        flush_playback = getattr(audio_session, "flush_playback", None)
+        if flush_playback is not None:
+            playback.on_clear = flush_playback
 
         tasks = {
             asyncio.create_task(send_audio()),
@@ -1026,16 +1025,12 @@ async def _run_audio_session(
             except Exception:
                 logger.exception("Failed to restore the terminal after typed input")
         await tool_calls.close()
-        for stream in reversed(started_streams):
+        playback.on_clear = None
+        if audio_session is not None:
             try:
-                stream.stop()
+                audio_session.close()
             except Exception:
-                logger.exception("Failed to stop local audio stream")
-        for stream in reversed(opened_streams):
-            try:
-                stream.close()
-            except Exception:
-                logger.exception("Failed to close local audio stream")
+                logger.exception("Failed to close the local audio session")
 
 
 async def listen_and_play_realtime(

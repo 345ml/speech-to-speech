@@ -584,6 +584,40 @@ def test_responses_api_backend_carries_no_sampling():
     assert parsed.llm_backend.config["gen_kwargs"] == {}
 
 
+def test_talk_leaves_echo_cancellation_off_by_default():
+    assert parse_talk_arguments([]).echo_cancellation == "off"
+
+
+def test_talk_accepts_the_operating_system_echo_canceller():
+    assert parse_talk_arguments(["--echo-cancellation", "os"]).echo_cancellation == "os"
+
+
+def test_talk_rejects_an_unknown_echo_cancellation_mode():
+    with pytest.raises(SystemExit):
+        parse_talk_arguments(["--echo-cancellation", "magic"])
+
+
+def test_local_leaves_echo_cancellation_off_by_default():
+    args = parse_arguments([], command="local")
+
+    assert args.local_audio_kwargs.local_audio_echo_cancellation == "off"
+
+
+@pytest.mark.parametrize(
+    "flag",
+    ["--echo-cancellation", "--local_audio_echo_cancellation", "--local-audio-echo-cancellation"],
+)
+def test_local_accepts_echo_cancellation_under_every_flag_spelling(flag):
+    args = parse_arguments([flag, "os"], command="local")
+
+    assert args.local_audio_kwargs.local_audio_echo_cancellation == "os"
+
+
+def test_serve_rejects_echo_cancellation():
+    with pytest.raises(ValueError, match="--local_audio_echo_cancellation"):
+        parse_arguments(["--local_audio_echo_cancellation", "os"], command="serve")
+
+
 def test_talk_enables_the_thinking_sound_by_default():
     config = parse_talk_arguments([])
 

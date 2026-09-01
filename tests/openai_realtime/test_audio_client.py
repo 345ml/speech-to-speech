@@ -1472,6 +1472,239 @@ async def test_audio_session_without_typed_input_creates_no_terminal(monkeypatch
     assert created[0].text_input is False
 
 
+class FakeAudioSession:
+    def __init__(self):
+        self.started = False
+        self.closed = False
+
+    def start(self):
+        self.started = True
+
+    def close(self):
+        self.closed = True
+
+
+class FlushableAudioSession(FakeAudioSession):
+    def __init__(self):
+        super().__init__()
+        self.flushes = 0
+
+    def flush_playback(self):
+        self.flushes += 1
+
+
+class FakeAudioIO:
+    def __init__(self, session=None):
+        self.request = None
+        self.on_capture = None
+        self.fill_playback = None
+        self.session = session or FakeAudioSession()
+
+    def open(self, request, *, on_capture, fill_playback):
+        self.request = request
+        self.on_capture = on_capture
+        self.fill_playback = fill_playback
+        return self.session
+
+
+class ScriptedConnection:
+    """Replays a script of server events, then holds the receive loop open."""
+
+    def __init__(self, events=()):
+        self.sent = []
+        self._events = list(events)
+        self.drained = asyncio.Event()
+
+    async def send(self, event):
+        self.sent.append(event)
+
+    async def recv(self):
+        if self._events:
+            return self._events.pop(0)
+        self.drained.set()
+        await asyncio.Event().wait()
+
+
+def audio_delta(pcm):
+    return SimpleNamespace(type="response.output_audio.delta", delta=base64.b64encode(pcm).decode("ascii"))
+
+
+async def run_session(monkeypatch, config, *, audio_io, events=(), body=None):
+    """Drive ``_run_audio_session`` far enough to exercise the audio wiring."""
+
+    modes = []
+    monkeypatch.setattr(
+        audio_client_module,
+        "create_audio_io",
+        lambda mode: (modes.append(mode), audio_io)[1],
+    )
+    conn = ScriptedConnection(events)
+    stop_event = Event()
+    task = asyncio.create_task(audio_client_module._run_audio_session(conn, config, stop_event))
+    try:
+        await wait_until(lambda: audio_io.on_capture is not None)
+        await asyncio.wait_for(conn.drained.wait(), timeout=2)
+        if body is not None:
+            await body(conn)
+    finally:
+        stop_event.set()
+        await asyncio.wait_for(task, timeout=5)
+    return conn, modes
+
+
+async def test_run_audio_session_opens_the_configured_backend_with_the_session_audio_format(monkeypatch, capsys):
+    audio_io = FakeAudioIO()
+    config = RealtimeAudioClientConfig(chunk_size=512, input_device=2, output_device=5, echo_cancellation="os")
+
+    _conn, modes = await run_session(monkeypatch, config, audio_io=audio_io)
+
+    assert modes == ["os"]
+    assert audio_io.request.send_rate == config.send_rate
+    assert audio_io.request.recv_rate == config.recv_rate
+    assert audio_io.request.chunk_size == 512
+    assert audio_io.request.input_device == 2
+    assert audio_io.request.output_device == 5
+    assert audio_io.session.started
+    capsys.readouterr()
+
+
+async def test_run_audio_session_forwards_captured_audio_to_the_server(monkeypatch, capsys):
+    audio_io = FakeAudioIO()
+
+    async def body(conn):
+        audio_io.on_capture(b"\x01\x02\x03\x04")
+        await wait_until(lambda: any(e["type"] == "input_audio_buffer.append" for e in conn.sent))
+
+    conn, _modes = await run_session(monkeypatch, RealtimeAudioClientConfig(), audio_io=audio_io, body=body)
+
+    appended = [e for e in conn.sent if e["type"] == "input_audio_buffer.append"]
+    assert base64.b64decode(appended[0]["audio"]) == b"\x01\x02\x03\x04"
+    capsys.readouterr()
+
+
+async def test_run_audio_session_keeps_the_microphone_open_during_playback_by_default(monkeypatch, capsys):
+    audio_io = FakeAudioIO()
+
+    async def body(conn):
+        audio_io.on_capture(b"\x01\x02")
+        await wait_until(lambda: any(e["type"] == "input_audio_buffer.append" for e in conn.sent))
+
+    conn, _modes = await run_session(
+        monkeypatch,
+        RealtimeAudioClientConfig(),
+        audio_io=audio_io,
+        events=[audio_delta(b"\x00\x01" * 400)],
+        body=body,
+    )
+
+    assert [e for e in conn.sent if e["type"] == "input_audio_buffer.append"]
+    capsys.readouterr()
+
+
+async def test_run_audio_session_drops_captured_audio_during_playback_when_blocking_is_enabled(monkeypatch, capsys):
+    audio_io = FakeAudioIO()
+
+    async def body(_conn):
+        audio_io.on_capture(b"\x01\x02")
+        await asyncio.sleep(0.05)
+
+    conn, _modes = await run_session(
+        monkeypatch,
+        RealtimeAudioClientConfig(block_mic_during_playback=True),
+        audio_io=audio_io,
+        events=[audio_delta(b"\x00\x01" * 400)],
+        body=body,
+    )
+
+    assert [e for e in conn.sent if e["type"] == "input_audio_buffer.append"] == []
+    capsys.readouterr()
+
+
+async def test_run_audio_session_fills_the_speaker_buffer_from_pending_audio(monkeypatch, capsys):
+    audio_io = FakeAudioIO()
+    filled = bytearray(8)
+
+    async def body(_conn):
+        await wait_until(lambda: _fill(audio_io, filled) == b"\x07\x08" * 4)
+
+    def _fill(io, target):
+        target[:] = bytes(len(target))
+        io.fill_playback(memoryview(target))
+        return bytes(target)
+
+    await run_session(
+        monkeypatch,
+        RealtimeAudioClientConfig(),
+        audio_io=audio_io,
+        events=[audio_delta(b"\x07\x08" * 4)],
+        body=body,
+    )
+    capsys.readouterr()
+
+
+async def test_run_audio_session_closes_the_audio_session_on_teardown(monkeypatch, capsys):
+    audio_io = FakeAudioIO()
+
+    await run_session(monkeypatch, RealtimeAudioClientConfig(), audio_io=audio_io)
+
+    assert audio_io.session.closed
+    capsys.readouterr()
+
+
+async def test_run_audio_session_discards_device_queued_audio_on_barge_in(monkeypatch, capsys):
+    # A backend that hands audio to the device ahead of time keeps playing it after
+    # the buffer is cleared, so the assistant has to be cut off at the device too.
+    audio_io = FakeAudioIO(FlushableAudioSession())
+
+    async def body(_conn):
+        await wait_until(lambda: audio_io.session.flushes > 0)
+
+    await run_session(
+        monkeypatch,
+        RealtimeAudioClientConfig(),
+        audio_io=audio_io,
+        events=[audio_delta(b"\x00\x01" * 400), SimpleNamespace(type="input_audio_buffer.speech_started")],
+        body=body,
+    )
+    capsys.readouterr()
+
+
+async def test_run_audio_session_tolerates_a_backend_that_cannot_flush(monkeypatch, capsys):
+    audio_io = FakeAudioIO()
+
+    conn, _modes = await run_session(
+        monkeypatch,
+        RealtimeAudioClientConfig(),
+        audio_io=audio_io,
+        events=[audio_delta(b"\x00\x01" * 400), SimpleNamespace(type="input_audio_buffer.speech_started")],
+    )
+
+    assert audio_io.session.closed
+    capsys.readouterr()
+
+
+def test_playback_buffer_tells_its_listener_when_it_is_cleared():
+    cleared = []
+    playback = PlaybackBuffer(16000)
+    playback.on_clear = lambda: cleared.append(True)
+    playback.append(b"\x01\x02")
+
+    playback.clear()
+
+    assert cleared == [True]
+
+
+def test_playback_buffer_survives_a_listener_that_raises(caplog):
+    playback = PlaybackBuffer(16000)
+    playback.on_clear = lambda: 1 / 0
+    playback.append(b"\x01\x02")
+
+    with caplog.at_level("ERROR"):
+        playback.clear()
+
+    assert playback.buffered_bytes == 0
+
+
 def steady_thinking_sound(amplitude=0.1):
     """A flat, non-zero loop so a block's samples say exactly how loud the cue is."""
 

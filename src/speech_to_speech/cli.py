@@ -142,6 +142,16 @@ def parse_talk_arguments(argv: Sequence[str]) -> RealtimeAudioClientConfig:
         default=defaults.block_mic_during_playback,
     )
     parser.add_argument(
+        "--echo-cancellation",
+        choices=("off", "os"),
+        default=defaults.echo_cancellation,
+        help=(
+            "Keep the speaker out of the microphone. 'os' routes both directions through the macOS "
+            "voice-processing unit, which cancels the assistant's own voice while leaving barge-in "
+            "working; it needs the macos-aec extra and falls back to 'off' elsewhere."
+        ),
+    )
+    parser.add_argument(
         "--no-thinking-sound",
         dest="thinking_sound",
         action="store_false",
@@ -193,6 +203,7 @@ def parse_talk_arguments(argv: Sequence[str]) -> RealtimeAudioClientConfig:
         print_json=namespace.print_json,
         text_input=namespace.text_input,
         block_mic_during_playback=namespace.block_mic_during_playback,
+        echo_cancellation=namespace.echo_cancellation,
         thinking_sound=namespace.thinking_sound,
         thinking_sound_file=namespace.thinking_sound_file,
         thinking_sound_gain=namespace.thinking_sound_gain,

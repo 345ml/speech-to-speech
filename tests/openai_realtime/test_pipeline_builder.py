@@ -59,3 +59,16 @@ def test_local_composes_loopback_client_with_same_server_builder(monkeypatch):
     assert server.port == 9876
     assert client.config.url == f"ws://127.0.0.1:{server.port}/v1/realtime"
     assert client.config.api_key == "local"
+
+
+def test_local_passes_the_echo_cancellation_choice_to_the_audio_client(monkeypatch):
+    args = _default_args()
+    args.local_audio_kwargs.local_audio_echo_cancellation = "os"
+    monkeypatch.setattr(
+        "speech_to_speech.s2s_pipeline._build_pipeline_unit",
+        lambda **_kwargs: SimpleNamespace(handlers=[object()]),
+    )
+
+    manager = build_local_pipeline(args, Event())
+
+    assert manager.handlers[2].config.echo_cancellation == "os"

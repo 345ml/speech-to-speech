@@ -12,6 +12,7 @@
 #   TTS_REF_TEXT           its transcript         (must match the audio -- see below)
 #   TTS_TEMP               TTS sampling           (default 0.9, mlx-audio's own)
 #   TEXT_INPUT=0           microphone only, no typed input
+#   ECHO_CANCELLATION=os   keep the speakers out of the microphone (macOS; see RUN.md)
 #   CHAT_SIZE              retained user turns    (default 12, see below)
 #   LLM_HOST / LLM_PORT    where serve_llm.sh is  (default 127.0.0.1:8080)
 #   LLM_MODEL_NAME         label sent to the server, not a model selector
@@ -86,6 +87,10 @@ args=(
 
 if [ "${TEXT_INPUT:-1}" = "1" ]; then
   args+=(--text-input)
+fi
+
+if [ -n "${ECHO_CANCELLATION:-}" ]; then
+  args+=(--echo-cancellation "$ECHO_CANCELLATION")
 fi
 
 # Only pass what was actually set: an unset sampling flag must stay absent from the
