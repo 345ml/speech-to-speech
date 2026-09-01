@@ -582,3 +582,46 @@ def test_responses_api_backend_carries_no_sampling():
     parsed = parse_arguments(["--llm_backend", "responses-api"])
 
     assert parsed.llm_backend.config["gen_kwargs"] == {}
+
+
+def test_talk_enables_the_thinking_sound_by_default():
+    config = parse_talk_arguments([])
+
+    assert config.thinking_sound is True
+    assert config.thinking_sound_file is None
+    assert config.thinking_sound_gain == 0.12
+    assert config.thinking_sound_delay_s == 0.3
+
+
+def test_talk_can_disable_the_thinking_sound():
+    assert parse_talk_arguments(["--no-thinking-sound"]).thinking_sound is False
+
+
+def test_talk_accepts_a_custom_thinking_sound():
+    config = parse_talk_arguments(
+        ["--thinking-sound-file", "cue.wav", "--thinking-sound-gain", "0.3", "--thinking-sound-delay", "0.5"]
+    )
+
+    assert config.thinking_sound_file == "cue.wav"
+    assert config.thinking_sound_gain == 0.3
+    assert config.thinking_sound_delay_s == 0.5
+
+
+def test_local_audio_defaults_enable_the_thinking_sound():
+    local_args = LocalAudioArguments()
+
+    assert local_args.local_audio_thinking_sound is True
+    assert local_args.local_audio_thinking_sound_file is None
+    assert local_args.local_audio_thinking_sound_gain == 0.12
+    assert local_args.local_audio_thinking_sound_delay == 0.3
+
+
+def test_local_accepts_thinking_sound_aliases():
+    args = parse_arguments(
+        ["--thinking-sound", "false", "--thinking-sound-gain", "0.2", "--thinking-sound-delay", "0.6"],
+        command="local",
+    )
+
+    assert args.local_audio_kwargs.local_audio_thinking_sound is False
+    assert args.local_audio_kwargs.local_audio_thinking_sound_gain == 0.2
+    assert args.local_audio_kwargs.local_audio_thinking_sound_delay == 0.6

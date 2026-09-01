@@ -1,10 +1,12 @@
 import asyncio
+import base64
 import json
 import signal
 import sys
 from threading import Event
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 import speech_to_speech.api.openai_realtime.audio_client as audio_client_module
@@ -21,6 +23,7 @@ from speech_to_speech.api.openai_realtime.audio_client import (
     normalize_realtime_url,
     run_realtime_audio_client,
 )
+from speech_to_speech.api.openai_realtime.thinking_sound import ThinkingSound
 
 TOOL_DEFINITION = {
     "type": "function",
@@ -1467,3 +1470,172 @@ async def test_audio_session_without_typed_input_creates_no_terminal(monkeypatch
 
     assert len(created) == 1
     assert created[0].text_input is False
+
+
+def steady_thinking_sound(amplitude=0.1):
+    """A flat, non-zero loop so a block's samples say exactly how loud the cue is."""
+
+    return ThinkingSound(np.full(1024, amplitude, dtype=np.float32), gain=1.0)
+
+
+def written_samples(playback, frames):
+    outdata = bytearray(frames * 2)
+    playback.write(outdata)
+    return np.frombuffer(bytes(outdata), dtype=np.int16)
+
+
+def thinking_playback(*, amplitude=0.1, delay_s=0.0):
+    return PlaybackBuffer(
+        16000,
+        thinking_sound=steady_thinking_sound(amplitude),
+        thinking_delay_s=delay_s,
+    )
+
+
+def test_thinking_sound_stays_silent_until_its_start_delay_elapses():
+    playback = thinking_playback(delay_s=0.1)
+    playback.start_thinking()
+
+    samples = written_samples(playback, 3200)
+
+    assert np.all(samples[:1600] == 0)
+    assert np.all(samples[1600:] != 0)
+
+
+def test_thinking_sound_does_not_mark_playback_active():
+    """`block_mic_during_playback` gates on this, so the cue must not close the mic."""
+
+    playback = thinking_playback()
+    playback.start_thinking()
+
+    samples = written_samples(playback, 1024)
+
+    assert np.all(samples != 0)
+    assert not playback.is_active()
+
+
+def test_thinking_sound_fades_out_beneath_the_first_response_audio():
+    playback = thinking_playback()
+    playback.start_thinking()
+    written_samples(playback, 1024)
+    playback.append(np.full(4096, 100, dtype=np.int16).tobytes())
+
+    playback.stop_thinking()
+    samples = written_samples(playback, 4096)
+
+    assert samples[0] > 100
+    assert samples[-1] == 100
+
+
+def test_thinking_sound_reaches_silence_after_the_fade():
+    playback = thinking_playback()
+    playback.start_thinking()
+    written_samples(playback, 1024)
+
+    playback.stop_thinking()
+    samples = written_samples(playback, 4096)
+
+    assert samples[0] != 0
+    assert samples[-1] == 0
+
+
+def test_clearing_playback_stops_the_thinking_sound_immediately():
+    playback = thinking_playback()
+    playback.start_thinking()
+    written_samples(playback, 1024)
+
+    playback.clear()
+
+    assert np.all(written_samples(playback, 1024) == 0)
+
+
+def test_speech_stopped_starts_the_thinking_sound(capsys):
+    playback = thinking_playback()
+
+    handle_server_event(
+        SimpleNamespace(type="input_audio_buffer.speech_stopped"),
+        playback=playback,
+        renderer=_FriendlyEventRenderer(),
+        print_json=False,
+    )
+
+    assert np.all(written_samples(playback, 1024) != 0)
+    capsys.readouterr()
+
+
+def test_first_response_audio_stops_the_thinking_sound(capsys):
+    playback = thinking_playback()
+    renderer = _FriendlyEventRenderer()
+    handle_server_event(
+        SimpleNamespace(type="input_audio_buffer.speech_stopped"),
+        playback=playback,
+        renderer=renderer,
+        print_json=False,
+    )
+    written_samples(playback, 1024)
+
+    handle_server_event(
+        SimpleNamespace(
+            type="response.output_audio.delta",
+            delta=base64.b64encode(np.full(4096, 100, dtype=np.int16).tobytes()).decode("ascii"),
+        ),
+        playback=playback,
+        renderer=renderer,
+        print_json=False,
+    )
+
+    assert written_samples(playback, 4096)[-1] == 100
+    capsys.readouterr()
+
+
+def test_finished_response_stops_the_thinking_sound(capsys):
+    playback = thinking_playback()
+    renderer = _FriendlyEventRenderer()
+    handle_server_event(
+        SimpleNamespace(type="input_audio_buffer.speech_stopped"),
+        playback=playback,
+        renderer=renderer,
+        print_json=False,
+    )
+    written_samples(playback, 1024)
+
+    handle_server_event(
+        response_done(status="completed"),
+        playback=playback,
+        renderer=renderer,
+        print_json=False,
+    )
+
+    assert written_samples(playback, 4096)[-1] == 0
+    capsys.readouterr()
+
+
+def test_playback_without_a_thinking_sound_stays_silent():
+    playback = PlaybackBuffer(16000)
+
+    playback.start_thinking()
+
+    assert np.all(written_samples(playback, 1024) == 0)
+
+
+def test_thinking_sound_is_built_at_the_playback_rate_by_default():
+    sound = audio_client_module.build_thinking_sound(RealtimeAudioClientConfig(recv_rate=24000))
+
+    assert len(sound) == pytest.approx(int(1.4 * 24000), abs=1)
+
+
+def test_thinking_sound_is_omitted_when_disabled():
+    assert audio_client_module.build_thinking_sound(RealtimeAudioClientConfig(thinking_sound=False)) is None
+
+
+def test_thinking_sound_file_overrides_the_generated_cue(tmp_path):
+    import soundfile as sf
+
+    path = tmp_path / "cue.wav"
+    sf.write(path, np.zeros(1600, dtype=np.float32), 16000)
+
+    sound = audio_client_module.build_thinking_sound(
+        RealtimeAudioClientConfig(thinking_sound_file=str(path)),
+    )
+
+    assert len(sound) == 1600
