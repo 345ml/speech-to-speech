@@ -23,6 +23,7 @@ from threading import Event, Lock
 from typing import Any, Optional
 from urllib.parse import urlsplit, urlunsplit
 
+import numpy as np
 from jsonschema import SchemaError, ValidationError
 from jsonschema.validators import validator_for
 from openai import AsyncOpenAI
@@ -33,12 +34,18 @@ from .text_input import (
     TextTurnSubmitter,
     create_text_terminal,
 )
+from .thinking_sound import DEFAULT_DELAY_S as THINKING_SOUND_DEFAULT_DELAY_S
+from .thinking_sound import DEFAULT_GAIN as THINKING_SOUND_DEFAULT_GAIN
+from .thinking_sound import ThinkingSound
 
 logger = logging.getLogger(__name__)
 
 _AssistantTranscriptStream = tuple[str | None, str | None, int | None, int | None]
 ToolExecutor = Callable[[str, dict[str, Any]], Awaitable[Any]]
 _TOOL_CREATE_ID_METADATA_KEY = "s2s_local_tool_create_id"
+# Long enough that the cue does not click when response audio cuts in, short
+# enough that it is gone before the first syllable lands.
+_THINKING_FADE_S = 0.08
 
 
 @dataclass(frozen=True)
@@ -66,10 +73,24 @@ class RealtimeAudioClientConfig:
     print_json: bool = False
     text_input: bool = False
     block_mic_during_playback: bool = False
+    thinking_sound: bool = True
+    thinking_sound_file: Optional[str] = None
+    thinking_sound_gain: float = THINKING_SOUND_DEFAULT_GAIN
+    thinking_sound_delay_s: float = THINKING_SOUND_DEFAULT_DELAY_S
     connection_retry_timeout_s: float = 30.0
     tools: list[dict[str, Any]] = field(default_factory=list)
     tool_executor: ToolExecutor | None = None
     tool_response_create: bool = True
+
+
+def build_thinking_sound(config: RealtimeAudioClientConfig) -> ThinkingSound | None:
+    """Resolve the configured cue, or None when the client should stay silent."""
+
+    if not config.thinking_sound:
+        return None
+    if config.thinking_sound_file:
+        return ThinkingSound.from_file(config.thinking_sound_file, config.recv_rate, gain=config.thinking_sound_gain)
+    return ThinkingSound.default(config.recv_rate, gain=config.thinking_sound_gain)
 
 
 def load_realtime_tool_module(module_name: str) -> tuple[list[dict[str, Any]], ToolExecutor, bool]:
@@ -209,16 +230,29 @@ def build_session_update(config: RealtimeAudioClientConfig) -> dict[str, Any]:
 class PlaybackBuffer:
     """Thread-safe audio state shared by the Realtime loop and sounddevice callbacks."""
 
-    def __init__(self, recv_rate: int) -> None:
+    def __init__(
+        self,
+        recv_rate: int,
+        *,
+        thinking_sound: ThinkingSound | None = None,
+        thinking_delay_s: float = THINKING_SOUND_DEFAULT_DELAY_S,
+    ) -> None:
         self.recv_rate = recv_rate
         self._audio = bytearray()
         self._lock = Lock()
         self._active_until = 0.0
+        self._thinking_sound = thinking_sound
+        self._thinking_delay_frames = max(0, int(round(thinking_delay_s * recv_rate)))
+        self._thinking_fade_frames = max(1, int(round(_THINKING_FADE_S * recv_rate)))
+        self._thinking_on = False
+        self._thinking_delay_left = 0
+        self._thinking_fade_left = 0
 
     def clear(self) -> None:
         with self._lock:
             self._active_until = 0.0
             self._audio.clear()
+            self._silence_thinking()
 
     def append(self, audio: bytes) -> None:
         with self._lock:
@@ -226,8 +260,34 @@ class PlaybackBuffer:
             self._active_until = time.monotonic() + max(0.15, len(audio) / (2 * self.recv_rate))
 
     def is_active(self) -> bool:
+        """Whether response audio is playing. The thinking cue deliberately does not count:
+        it must not close the microphone the way assistant speech does."""
+
         with self._lock:
             return bool(self._audio) or time.monotonic() < self._active_until
+
+    def start_thinking(self) -> None:
+        """Arm the cue that fills the gap until the first response audio arrives."""
+
+        with self._lock:
+            if self._thinking_sound is None:
+                return
+            self._thinking_sound.reset()
+            self._thinking_on = True
+            self._thinking_delay_left = self._thinking_delay_frames
+            self._thinking_fade_left = 0
+
+    def stop_thinking(self) -> None:
+        """Ramp the cue down instead of cutting it, so it does not click."""
+
+        with self._lock:
+            if not self._thinking_on:
+                return
+            if self._thinking_delay_left > 0:
+                self._silence_thinking()
+                return
+            if self._thinking_fade_left == 0:
+                self._thinking_fade_left = self._thinking_fade_frames
 
     def write(self, outdata: Any) -> None:
         needed = len(outdata)
@@ -238,11 +298,47 @@ class PlaybackBuffer:
                 del self._audio[:available]
             if available < needed:
                 outdata[available:] = b"\x00" * (needed - available)
+            overlay = self._next_thinking_block(needed // 2)
+            if overlay is None:
+                return
+            mixed = np.frombuffer(bytes(outdata[: len(overlay) * 2]), dtype=np.int16).astype(np.int32)
+            mixed += np.rint(overlay * 32767.0).astype(np.int32)
+            outdata[: len(overlay) * 2] = np.clip(mixed, -32768, 32767).astype(np.int16).tobytes()
 
     @property
     def buffered_bytes(self) -> int:
         with self._lock:
             return len(self._audio)
+
+    def _silence_thinking(self) -> None:
+        self._thinking_on = False
+        self._thinking_delay_left = 0
+        self._thinking_fade_left = 0
+
+    def _next_thinking_block(self, frames: int) -> np.ndarray | None:
+        """The cue's contribution to this callback, or None when it is silent."""
+
+        if not self._thinking_on or self._thinking_sound is None or frames <= 0:
+            return None
+        block = np.zeros(frames, dtype=np.float32)
+        offset = 0
+        if self._thinking_delay_left > 0:
+            offset = min(frames, self._thinking_delay_left)
+            self._thinking_delay_left -= offset
+            if offset == frames:
+                return None
+        audible = frames - offset
+        block[offset:] = self._thinking_sound.next_block(audible)
+        if self._thinking_fade_left > 0:
+            faded = min(audible, self._thinking_fade_left)
+            start = self._thinking_fade_left / self._thinking_fade_frames
+            end = (self._thinking_fade_left - faded) / self._thinking_fade_frames
+            block[offset : offset + faded] *= np.linspace(start, end, faded, endpoint=False, dtype=np.float32)
+            block[offset + faded :] = 0.0
+            self._thinking_fade_left -= faded
+            if self._thinking_fade_left == 0:
+                self._silence_thinking()
+        return block
 
 
 class _FriendlyEventRenderer:
@@ -341,6 +437,9 @@ def handle_server_event(
             renderer.line("")
         renderer.saw_user_speech = True
     elif event.type == "input_audio_buffer.speech_stopped":
+        # The gap between here and the first audio delta is STT plus the LLM plus
+        # the first TTS chunk. Fill it so the silence does not read as a hang.
+        playback.start_thinking()
         return
     elif event.type == "conversation.item.input_audio_transcription.delta":
         renderer.finish_live_assistant_text()
@@ -367,6 +466,7 @@ def handle_server_event(
     }:
         return
     elif event.type == "response.output_audio.delta":
+        playback.stop_thinking()
         playback.append(base64.b64decode(event.delta))
     elif event.type == "response.output_audio.done":
         renderer.finish_live_assistant_text()
@@ -379,6 +479,9 @@ def handle_server_event(
         renderer.finish_live_assistant_text()
         renderer.line(f"TOOL: {event.name} call_id={event.call_id} arguments={event.arguments}")
     elif event.type == "response.done":
+        # A response that never produced audio -- an error, a tool-only turn --
+        # would otherwise leave the cue looping with nothing left to wait for.
+        playback.stop_thinking()
         renderer.finish_assistant_response(getattr(event.response, "id", None))
         if event.response.status == "cancelled":
             playback.clear()
@@ -386,6 +489,7 @@ def handle_server_event(
     elif event.type == "output_audio_buffer.cleared":
         playback.clear()
     elif event.type == "error":
+        playback.stop_thinking()
         renderer.clear_live_user_text()
         renderer.finish_live_assistant_text()
         renderer.line(f"ERROR: {event.error.type}: {event.error.message}")
@@ -807,7 +911,11 @@ async def _run_audio_session(
     import sounddevice as sd
 
     mic_queue: Queue[bytes] = Queue(maxsize=128)
-    playback = PlaybackBuffer(config.recv_rate)
+    playback = PlaybackBuffer(
+        config.recv_rate,
+        thinking_sound=build_thinking_sound(config),
+        thinking_delay_s=config.thinking_sound_delay_s,
+    )
     text_terminal = create_text_terminal(config)
     console: ConsoleSink = text_terminal.console if text_terminal is not None else StdoutConsole()
     renderer = _FriendlyEventRenderer(console)

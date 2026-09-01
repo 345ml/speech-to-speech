@@ -8,6 +8,7 @@ from io import StringIO
 from threading import Event
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
 from speech_to_speech.api.openai_realtime.audio_client import PlaybackBuffer
@@ -22,6 +23,7 @@ from speech_to_speech.api.openai_realtime.text_input import (
     create_text_terminal,
     terminal_is_interactive,
 )
+from speech_to_speech.api.openai_realtime.thinking_sound import ThinkingSound
 
 
 class RecordingConnection:
@@ -119,6 +121,23 @@ async def test_typed_turn_stops_local_playback_before_the_first_send() -> None:
     await submitter.submit("stop")
 
     assert buffered_at_send[0] == 0
+
+
+async def test_typed_turn_starts_the_thinking_sound() -> None:
+    """A typed turn has the same generation gap as a spoken one."""
+
+    playback = PlaybackBuffer(
+        16000,
+        thinking_sound=ThinkingSound(np.full(1024, 0.1, dtype=np.float32), gain=1.0),
+        thinking_delay_s=0.0,
+    )
+    submitter = TextTurnSubmitter(RecordingConnection(), playback=playback, console=RecordingConsole())
+
+    await submitter.submit("hello")
+
+    outdata = bytearray(2048)
+    playback.write(outdata)
+    assert np.all(np.frombuffer(bytes(outdata), dtype=np.int16) != 0)
 
 
 async def test_typed_turn_never_sends_output_audio_buffer_clear() -> None:

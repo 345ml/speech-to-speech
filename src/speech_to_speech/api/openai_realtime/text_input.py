@@ -315,6 +315,9 @@ class TextTurnSubmitter:
             }
         )
         await self._conn.send({"type": "response.create"})
+        # After the sends, not before: `clear()` above stops whatever was already
+        # armed, and a typed turn waits on the same generation gap as a spoken one.
+        self._playback.start_thinking()
 
 
 class TextInputCoordinator:

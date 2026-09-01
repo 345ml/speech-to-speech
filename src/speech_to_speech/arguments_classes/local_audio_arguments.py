@@ -29,6 +29,37 @@ class LocalAudioArguments:
             "help": "Pause local microphone capture while audio is playing. Disabled by default so barge-in works."
         },
     )
+    local_audio_thinking_sound: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Play a quiet looping cue between the end of your turn and the first response audio, "
+                "so the generation gap does not sound like a hang. Disable with --thinking-sound false."
+            ),
+            "aliases": ["--thinking-sound"],
+        },
+    )
+    local_audio_thinking_sound_file: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "Audio file looped as the processing cue instead of the built-in one.",
+            "aliases": ["--thinking-sound-file"],
+        },
+    )
+    local_audio_thinking_sound_gain: float = field(
+        default=0.12,
+        metadata={
+            "help": "Processing cue level. Keep it low: the speaker feeds back into the microphone.",
+            "aliases": ["--thinking-sound-gain"],
+        },
+    )
+    local_audio_thinking_sound_delay: float = field(
+        default=0.3,
+        metadata={
+            "help": "Seconds to wait before the processing cue starts, so fast turns stay silent.",
+            "aliases": ["--thinking-sound-delay"],
+        },
+    )
     local_audio_print_json: bool = field(
         default=False,
         metadata={"help": "Print raw Realtime events received by the packaged local audio client."},
