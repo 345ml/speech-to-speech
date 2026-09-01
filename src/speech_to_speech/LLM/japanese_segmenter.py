@@ -4,14 +4,25 @@ NLTK's punkt tokenizer does not treat 。 as a sentence terminator, so a Japanes
 reply reaches the TTS as a single sentence and nothing is spoken until the language
 model has finished generating. The reply's length lands directly on time-to-first-audio.
 
-The core asymmetry: **the first clause of a turn is cut aggressively, every later one
-conservatively.** Only the first clause sits on the TTFA critical path. Splitting later
+The core asymmetry: **the first clause of a turn is cut by a different rule than every
+later one.** Only the first clause sits on the TTFA critical path. Splitting later
 clauses at 、 buys no latency and costs prosody, because a neural TTS needs the fuller
 clause to place accent and intonation.
 
-Ported from the companion phase 0 harness, which measured 166 ms of TTFA coming from
-releasing a 2-4 character opening interjection (「え、」「うん、」「そっか、」) before
-the rest of the reply exists.
+The first-clause floor sits ABOVE interjection length, which reverses the rule this
+module shipped with. Cutting at the very first boundary released the 2-3 character
+interjection the prompt asks the model to open on, so segment 0 -- the only part the
+listener hears first -- was almost always the same two words. Measured over 90 turns
+(Qwen3-4B-Instruct-2507 Q4_K_M, the RUN.md prompt): 「うん、」 94.4%, 「えっ、」 5.6%,
+3 distinct openers in total. Raising the floor to 6 changes nothing about what the
+model generates and lets the rest of the reaction into segment 0 instead: 60 distinct
+openers, most frequent 15.6%, for 106 ms of time-to-first-audio at p50.
+
+Two rationales the original floor of 2 rested on were re-measured and did not hold:
+the TTS instability on short input is a sampling-temperature effect, not a length one
+(greedy is bit-identical across runs at every length), and the playback underrun it
+was meant to avoid does not occur -- the gap between consecutive clauses leaving the
+language model is ~136 ms at p50, well inside even a 3-character clause's audio.
 """
 
 from __future__ import annotations
@@ -36,9 +47,11 @@ _STRIP_AFTER_CUT = _BLANK + "\n"
 class JapaneseSegmenterConfig:
     """Cut thresholds, in characters."""
 
-    # The first clause cuts at the FIRST boundary of any kind. Japanese opening
-    # interjections are 2-4 characters and releasing one immediately IS the latency win.
-    first_min_chars: int = 2
+    # The first clause cuts at the first boundary of any kind AT OR AFTER this floor.
+    # Set above interjection length on purpose: cutting at the very first boundary made
+    # segment 0 a bare 2-3 character interjection on 100% of measured turns, so every
+    # turn opened on the same word. See the module docstring for the measurements.
+    first_min_chars: int = 6
     # A 。 is a real sentence end: cutting there is always prosodically correct, so it
     # needs only a floor that rejects debris, not a length quota.
     hard_min_chars: int = 4

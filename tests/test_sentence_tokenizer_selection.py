@@ -35,12 +35,13 @@ def test_japanese_variants_are_recognised() -> None:
 
 
 def test_each_call_returns_a_fresh_japanese_tokenizer() -> None:
-    # State surviving across turns would stop the second turn's opening interjection
-    # from being cut, because the segmenter would think it had already been released.
+    # State surviving across turns would stop the second turn's first clause from
+    # being cut by the first-clause rule, because the segmenter would think it had
+    # already been released.
     first = make_sentence_tokenizer("ja")
-    first("うん、そっか")
+    first("うん、そうなんだ。ゆっくり")
     second = make_sentence_tokenizer("ja")
-    assert second("うん、そっか") == ["うん、", "そっか"]
+    assert second("うん、そうなんだ。ゆっくり") == ["うん、そうなんだ。", "ゆっくり"]
 
 
 def test_english_tokenizer_behaviour_is_unchanged() -> None:
