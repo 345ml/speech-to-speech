@@ -4,9 +4,11 @@ import numpy as np
 import pytest
 
 import speech_to_speech.api.openai_realtime.audio_io_macos as audio_io_macos
+from speech_to_speech.api.openai_realtime.audio_client import PlaybackBuffer
 from speech_to_speech.api.openai_realtime.audio_io import AudioStreamRequest
-from speech_to_speech.api.openai_realtime.audio_io_macos import VoiceProcessingAudioIO
+from speech_to_speech.api.openai_realtime.audio_io_macos import _FEED_INTERVAL_SECONDS, VoiceProcessingAudioIO
 from speech_to_speech.api.openai_realtime.audio_resample import pcm16_to_float32
+from speech_to_speech.api.openai_realtime.thinking_sound import ThinkingSound
 
 from .fake_avfoundation import FakeAVFoundation, FakeTime
 
@@ -289,6 +291,74 @@ def test_playback_starts_queueing_as_soon_as_there_is_audio(av):
     pending["audio"] = True
 
     assert session._pump_playback()
+    assert av.player.scheduled
+
+
+def test_idle_polling_asks_for_no_more_audio_than_it_waits_out(av):
+    # The filler advances real-time state -- the thinking cue's start delay counts down
+    # in frames asked for. While idle the pump polls far faster than it plays and throws
+    # away what it gets, so asking for a whole chunk each poll would burn that delay at
+    # the ratio between the chunk and the poll interval, and the cue would start early.
+    asked = []
+
+    def fill(outdata):
+        asked.append(len(outdata) // 2)
+        outdata[:] = bytes(len(outdata))
+
+    session = open_session(av, fill_playback=fill)
+
+    for _ in range(10):
+        assert not session._pump_playback()
+
+    poll_frames = _FEED_INTERVAL_SECONDS * REQUEST.recv_rate
+    assert asked and all(frames <= poll_frames for frames in asked)
+
+
+def test_a_first_audible_block_is_queued_without_waiting_out_a_chunk(av):
+    # The idle fill is small so the cue stays honest, not so the response is delayed:
+    # the first poll that finds audio still has to queue it.
+    pending = {"audio": False}
+
+    def fill(outdata):
+        outdata[:] = (b"\x10\x20" if pending["audio"] else b"\x00\x00") * (len(outdata) // 2)
+
+    session = open_session(av, fill_playback=fill)
+    for _ in range(10):
+        assert not session._pump_playback()
+
+    pending["audio"] = True
+
+    assert session._pump_playback()
+    # And from there it uses full chunks to build the lead rather than crawling.
+    while session._pump_playback():
+        pass
+    assert session._frames_in_flight() >= session._target_lead_frames
+
+
+def test_the_thinking_cue_does_not_start_before_its_delay_has_elapsed(av):
+    """The cue's start delay is counted in frames asked for, and this backend asks
+    far faster than it plays. Guard the whole path rather than only the fill size:
+    what must hold is that a cue configured to wait 0.3s is still silent halfway
+    through that wait, and audible once it is over."""
+
+    delay_s = 0.3
+    playback = PlaybackBuffer(
+        REQUEST.recv_rate,
+        thinking_sound=ThinkingSound(np.full(1024, 0.5, dtype=np.float32), gain=1.0),
+        thinking_delay_s=delay_s,
+    )
+    session = open_session(av, fill_playback=playback.write)
+    playback.start_thinking()
+
+    def poll(seconds):
+        """Pump for as long as the feeder would take to cover ``seconds`` of real time."""
+        for _ in range(int(seconds / _FEED_INTERVAL_SECONDS)):
+            session._pump_playback()
+
+    poll(delay_s / 2)
+    assert av.player.scheduled == []
+
+    poll(delay_s)
     assert av.player.scheduled
 
 

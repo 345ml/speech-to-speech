@@ -115,6 +115,8 @@ class VoiceProcessingAudioSession:
         self._playback_resampler = StreamResampler(request.recv_rate, self._render_rate)
         self._playback_chunk_frames = request.chunk_size
         self._target_lead_frames = int(self._render_rate * _TARGET_LEAD_SECONDS)
+        # One poll's worth of playback frames; see the note in _pump_playback.
+        self._idle_fill_frames = max(1, int(round(_FEED_INTERVAL_SECONDS * request.recv_rate)))
 
         self._input_node.installTapOnBus_bufferSize_format_block_(0, request.chunk_size, capture_format, self._on_tap)
 
@@ -206,9 +208,19 @@ class VoiceProcessingAudioSession:
             generation = self._generation
             resampler = self._playback_resampler
 
+        # While the player is idle, ask for one poll's worth rather than a whole chunk.
+        # Filling is not free of consequence: the filler advances real-time state on
+        # every call -- the thinking cue's start delay counts down in frames asked for,
+        # on the assumption that asking for them costs the time they take to play. A
+        # sound card keeps that true by asking only as fast as it plays. This feeder
+        # polls far faster than that and throws away what it gets while idle, so asking
+        # for a chunk each poll would run the cue ahead of the clock. Asking for exactly
+        # one interval's worth keeps it honest without delaying the start of a response.
+        frames = self._playback_chunk_frames if in_flight > 0 else self._idle_fill_frames
+
         # Filling and resampling stay outside the lock: the filler reaches into the
         # playback buffer, which the event loop also holds a lock on.
-        raw = bytearray(self._playback_chunk_frames * 2)
+        raw = bytearray(frames * 2)
         self._fill_playback(memoryview(raw))
         if in_flight == 0 and not any(raw):
             # Idle. Building a lead out of silence would only push the first audio of

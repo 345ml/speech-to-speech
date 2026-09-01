@@ -152,6 +152,30 @@ def parse_talk_arguments(argv: Sequence[str]) -> RealtimeAudioClientConfig:
         ),
     )
     parser.add_argument(
+        "--no-thinking-sound",
+        dest="thinking_sound",
+        action="store_false",
+        default=defaults.thinking_sound,
+        help="Do not play the processing cue between the end of your turn and the first response audio.",
+    )
+    parser.add_argument(
+        "--thinking-sound-file",
+        default=defaults.thinking_sound_file,
+        help="Audio file looped as the processing cue instead of the built-in one.",
+    )
+    parser.add_argument(
+        "--thinking-sound-gain",
+        type=float,
+        default=defaults.thinking_sound_gain,
+        help="Processing cue level. Keep it low: the speaker feeds back into the microphone.",
+    )
+    parser.add_argument(
+        "--thinking-sound-delay",
+        type=float,
+        default=defaults.thinking_sound_delay_s,
+        help="Seconds to wait before the processing cue starts, so fast turns stay silent.",
+    )
+    parser.add_argument(
         "--connection-retry-timeout",
         type=float,
         default=defaults.connection_retry_timeout_s,
@@ -180,6 +204,10 @@ def parse_talk_arguments(argv: Sequence[str]) -> RealtimeAudioClientConfig:
         text_input=namespace.text_input,
         block_mic_during_playback=namespace.block_mic_during_playback,
         echo_cancellation=namespace.echo_cancellation,
+        thinking_sound=namespace.thinking_sound,
+        thinking_sound_file=namespace.thinking_sound_file,
+        thinking_sound_gain=namespace.thinking_sound_gain,
+        thinking_sound_delay_s=namespace.thinking_sound_delay,
         connection_retry_timeout_s=namespace.connection_retry_timeout,
         tools=tools,
         tool_executor=tool_executor,

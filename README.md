@@ -199,6 +199,25 @@ or another compatible server, see
 
 The packaged client can opt in to local Python tools with `talk --tool-module <module>` or `local --tool-module <module>`. The module contract, programmatic API, and a Serper web-search example are documented in [Tool calling design](./src/speech_to_speech/api/openai_realtime/README.md#packaged-python-client-tools).
 
+### Processing cue
+
+Between the end of your turn and the first response audio, the packaged client waits on STT, the LLM and the
+first TTS chunk. `talk` and `local` fill that silence with a quiet looping cue so the gap does not read as a
+hang, starting 0.3s after you stop speaking so short turns stay silent and fading out under the first syllable.
+
+```bash
+speech-to-speech talk --no-thinking-sound              # off
+speech-to-speech talk --thinking-sound-file cue.wav    # your own loop
+speech-to-speech local --thinking-sound false          # off, `local` spelling
+```
+
+`--thinking-sound-gain` (default `0.12`) and `--thinking-sound-delay` (default `0.3`) tune level and start
+delay. The cue plays through the same speaker your microphone hears, and it deliberately does not count as
+playback for `--block-mic-during-playback`, so the microphone stays open and you can still interrupt. Turn the
+gain down if VAD starts triggering on the cue itself. Under `--echo-cancellation os` the cue is mixed in before
+the audio reaches the speaker, so the voice-processing unit subtracts it from the capture the same way it
+subtracts the assistant's voice, and the gain matters much less.
+
 ### Typing instead of speaking
 
 Pass `--text-input` to `talk` or `local` to type a turn while the microphone stays live:
